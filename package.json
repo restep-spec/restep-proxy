@@ -1,0 +1,24 @@
+{
+  "name": "restep-proxy",
+  "version": "0.1.0",
+  "description": "Proxy inverso que vigila el contrato Restep 1 en tráfico real",
+  "type": "module",
+  "bin": {
+    "restep-proxy": "restep-proxy.mjs"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/restep-spec/restep-proxy.git"
+  },
+  "homepage": "https://restep.wubytes.com/tools/",
+  "bugs": {
+    "url": "https://github.com/restep-spec/restep-proxy/issues"
+  },
+  "scripts": {
+    "test": "node test.mjs"
+  }
+}
