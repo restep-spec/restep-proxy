@@ -5,15 +5,15 @@ en tráfico real. Se pone delante de una API, reenvía todo sin alterarlo y comp
 petición/respuesta contra la especificación y contra el documento de descubrimiento (§4.2) de esa
 API. Un solo archivo, Node 18+, sin dependencias.
 
-Donde [`restep-check`](https://restep.wubytes.com/tools/restep-check.mjs) genera su propio tráfico para probar una
+Donde [`restep-check`](https://restep.wubytes.com/tools/restep-check/) genera su propio tráfico para probar una
 API, `restep-proxy` mira el que ya hay: el de una aplicación, una batería de pruebas de integración
 o un agente. Sirve para descubrir qué parte del contrato rompe un cliente o un servidor de verdad.
 
 ## Uso
 
 ```bash
-node vendor/restep-server.mjs                                            # API de prueba en :8080
-node tools/restep-proxy/restep-proxy.mjs --target http://localhost:8080 --port 8871
+# con tu API escuchando en :8080
+npx restep-proxy --target http://localhost:8080 --port 8871
 curl -g 'http://localhost:8871/books?filter[price][le]=15'                   # el tráfico va al proxy
 ```
 
@@ -52,7 +52,7 @@ violaciones. Su `502` lleva `code: "bad_gateway"`, `upstream_status` y la lista 
 ### En CI
 
 ```bash
-node tools/restep-proxy/restep-proxy.mjs --target http://localhost:8080 --port 8871 \
+npx restep-proxy --target http://localhost:8080 --port 8871 \
   --report restep-proxy.json --strict --quiet &
 PROXY=$!
 API_URL=http://localhost:8871 npm test        # las pruebas de integración, contra el proxy
