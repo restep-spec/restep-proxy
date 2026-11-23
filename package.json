@@ -7,6 +7,10 @@
     "restep-proxy": "restep-proxy.mjs"
   },
   "license": "MIT",
+  "files": [
+    "restep-proxy.mjs",
+    "README.md"
+  ],
   "engines": {
     "node": ">=18"
   },
