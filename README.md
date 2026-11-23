@@ -1,7 +1,7 @@
 # restep-proxy
 
-Proxy HTTP inverso que vigila el contrato [Restep 1](https://restep.wubytes.com/1/) en tráfico
-real. Se pone delante de una API, reenvía todo sin alterarlo y comprueba cada par
+Proxy HTTP inverso que vigila el contrato [Restep 1](https://restep.wubytes.com/1/) (borrador 6)
+en tráfico real. Se pone delante de una API, reenvía todo sin alterarlo y comprueba cada par
 petición/respuesta contra la especificación y contra el documento de descubrimiento (§4.2) de esa
 API. Un solo archivo, Node 18+, sin dependencias.
 
@@ -30,7 +30,10 @@ curl -g 'http://localhost:8871/books?filter[price][le]=15'                   # e
 
 Al arrancar hace un `GET` a la raíz para leer el descubrimiento (con `Authorization: Bearer` si
 está `RESTEP_TOKEN`). Si no lo consigue, supone solo `core` hasta que pase uno por el proxy; cada
-`GET` a la raíz que pasa lo actualiza.
+`GET` a la raíz que pasa lo actualiza. Un documento cuyo `restep` no sigue la gramática de §1.1 o
+no es de Restep 1 no se usa (y su respuesta da `discovery.version`). Las partes experimentales
+(`sync`, `inherit`) solo se juzgan si la versión declarada es una cuyo texto conoce el proxy:
+`"1.0-draft.6"` (§1.2, `KNOWN_TEXTS`).
 
 ### Salida
 
@@ -58,52 +61,79 @@ kill -INT $PROXY; wait $PROXY                  # sale con 1 si hubo alguna viola
 
 ## Qué comprueba
 
-Cada comprobación nombra su apartado de la especificación. Las que dependen del descubrimiento
-(colecciones, filtros, perfiles) solo se hacen si lo hay.
+Cada comprobación nombra su apartado de la especificación (del borrador 6). Las que dependen del
+descubrimiento (colecciones, singletons, filtros, perfiles) solo se hacen si lo hay. Las de
+`cache` (`cache-control`, `cache-etag`, `if-none-match` en lecturas) solo si se anuncia `cache`, y
+las de `writes` solo si se anuncia `writes`: desde el borrador 6, `Cache-Control` y `304` son de
+`cache`. Los avisos de `deprecations` se leen en su sitio (raíz, colección o singleton) y con los
+`kind` del borrador 6; uno con otro `kind` se ignora.
 
 | Comprobación | § | Nivel | Qué verifica |
 |---|---|---|---|
-| `json` | 3 | DEBE | Un cuerpo JSON es JSON válido en UTF-8 (también comprimido) |
-| `links` | 3 | DEBE | `next` es una URI absoluta o una ruta absoluta bajo la raíz |
-| `profile-link` | 4.1 | DEBERÍA | Un enlace `rel="profile"` por perfil y extensión anunciados |
-| `health` | 4.4 | DEBE | El `status` declarado da `200`/`503` con `no-store` (o `401`, `403`, `429`) |
-| `allow` | 4.3 | DEBE | `Allow` de un `405` = `methods`/`item_methods` declarados; un método declarado no da `405` |
-| `status.success` | 5.1 | DEBE | `GET` 200, `POST` 201, `PATCH` 200 (204 con `return=minimal`), `DELETE` 204 |
-| `location` | 5.1 | DEBE | Un `201` lleva `Location` = ruta de la colección + `/` + `id` |
-| `id.assigned` | 5.1 | DEBE | Un `POST` con `id` o un `PATCH` con otro `id` no tienen éxito |
-| `patch.object` | 5.1 | DEBE | Un parche que no es un objeto JSON no tiene éxito |
-| `collection.shape` | 5.2 | DEBE | `{items, next}`, con `next` cadena o `null` |
-| `reserved` | 5.3 | DEBE | Un parámetro reservado no implementado (o en una forma no admitida, o `$…`) no se ignora |
-| `error.media-type` | 5.4 | DEBE | Los `4xx`/`5xx` con cuerpo van en `application/problem+json` |
-| `error.schema` | 5.4 | DEBE | El error cumple [`problem.json`](https://restep.wubytes.com/1/schema/problem.json) |
-| `error.status` | 5.4 | DEBE | `status` del cuerpo = estado de la respuesta |
-| `error.code` | 5.4 | DEBE | `code` de la tabla para ese estado, del registro de la IANA o `http_NNN` |
-| `error.type`, `error.detail` | 5.4 | DEBERÍA | `type` coherente con `code`; hay `detail` |
-| `error.401`, `error.405` | 5.4, 5.1 | DEBE | `WWW-Authenticate` en un `401`; `Allow` en un `405` |
-| `error.retry-after` | 5.4 | DEBERÍA | `Retry-After` en `429` y `503` |
-| `error.parameter` | 5.3 | DEBE | `parameter` presente y, en `unsupported_parameter`, uno de los que llegaron |
-| `no-error-in-200` | 5.4 | DEBE | Ningún objeto problem dentro de un `2xx` |
-| `deprecation` | 5.5 | DEBE | Lo listado en `deprecations` lleva `Deprecation` (y `Sunset`); pasada la fecha, deja de funcionar |
-| `item.discovery` | 3, 4.2, 5.7 | DEBE | Los elementos encajan con el tipo de sus campos de filtro, `language_maps`, `relations` e `inherit` |
-| `query.declared-rejected` | 5.3 | DEBE | Un filtro, orden, recuento o `limit`/`cursor`/`fields` anunciados no se rechazan con `unsupported_parameter` |
-| `query.undeclared` | 5.3 | DEBE | Un campo u operador de filtro o un orden no declarados no se aceptan |
-| `filter.match` | 6.1 | DEBE | Cada elemento devuelto cumple cada filtro, según el tipo declarado (decimales exactos) |
-| `sort.order` | 6.2 | DEBE | La página viene en el orden pedido, con los valores ausentes al final |
-| `fields` | 6.3 | DEBE | Solo los campos pedidos, `id` y los miembros `_` |
-| `limit` | 6.4 | DEBE | La página no pasa de `limit`; un `limit` fuera de rango no se acepta |
-| `next` | 6.4 | DEBE | `next` lleva `cursor` y conserva los demás parámetros |
-| `count` | 6.5 | DEBE | `count=true` añade `total` |
-| `idempotency.key` | 7.1 | DEBE | Una `Idempotency-Key` mal formada no se acepta |
-| `idempotency.replay` | 7.1 | DEBE | La misma petición con la misma clave devuelve el mismo estado y cuerpo |
-| `idempotency.replayed-header` | 7.1 | DEBERÍA | La repetición lleva `Idempotent-Replayed: true` |
-| `idempotency.mismatch` | 7.1 | DEBE | La misma clave con otro cuerpo no tiene éxito |
-| `etag` | 7.2 | DEBE | `GET` de un elemento: ETag fuerte o, con `fields`/codificación, `_etag` |
-| `if-match` | 7.2 | DEBE | `If-Match` con una ETag que el proxy sabe antigua da `412`; con la vigente, no |
-| `precondition` | 7.2 | DEBE | Un `412` responde a una cabecera condicional; un `428`, a una escritura sin `If-Match` |
-| `if-none-match` | 7.3 | DEBE | Si coincide: `304` a `GET`/`HEAD`, `412` a una escritura |
-| `cache-control` | 7.3 | DEBE | Todo `GET`/`HEAD` (también los errores) lleva `Cache-Control` (con `writes`) |
-| `cache-private` | 7.3 | DEBE | Con `Authorization`, `private` o `no-store` |
-| `minimal` | 7.4 | DEBERÍA | Una respuesta mínima lleva `ETag`, `Location` (en `201`) y `Preference-Applied` |
+| `json` | 3 | DEBE | Un cuerpo JSON es JSON válido en UTF-8 |
+| `json-type` | 3 | DEBE | Un 2xx con cuerpo lleva Content-Type: application/json (un esquema puede ir como application/schema+json) |
+| `media-type` | 3 | DEBE | Un POST o QUERY con cuerpo sin Content-Type, de otro tipo o con un charset que no es UTF-8, o un PATCH de otro tipo, da 415; un cuerpo vacío con application/json da 400 |
+| `media-type.accept-patch` | 5.1 | DEBERÍA | Un 415 a un PATCH lleva Accept-Patch |
+| `links` | 3 | DEBE | next y href son URI absolutas o rutas absolutas bajo la raíz de la API, y una URI absoluta (también en Location y Link) usa https o el esquema de la raíz |
+| `discovery.version` | 1.1 | DEBE | El restep del descubrimiento sigue la gramática mayor.menor[-draft.N\|-rc.N] y es de Restep 1 |
+| `profile-link` | 4.1 | DEBERÍA | Cada respuesta lleva un único enlace rel="profile", a la URI de la versión |
+| `health` | 4.4 | DEBE | El recurso de status responde 200 o 503 con Cache-Control: no-store (o 401, 403, 429) |
+| `allow` | 4.3 | DEBE | Un 405 nombra en Allow los métodos declarados y ninguno más; un método declarado nunca da 405 |
+| `status.success` | 5.1 | DEBE | Éxitos con el estado de la tabla: GET 200, POST 201, PATCH 200 (204 con return=minimal), DELETE 204 |
+| `location` | 5.1 | DEBE | Un 201 lleva Location con la ruta del elemento: la de su colección, / y su id |
+| `id.assigned` | 5.1 | DEBE | Un PATCH con otro id da 422; un POST con id, donde id_from no lo permite, también; y sin id, donde id_from es "client" |
+| `patch.object` | 5.1 | DEBE | Un parche que no es un objeto JSON da 400, no éxito |
+| `collection.shape` | 5.2 | DEBE | Una colección responde {items, next}, con next presente (cadena o null) |
+| `reserved` | 5.3 | DEBE | Un parámetro reservado que el recurso no implementa da 400 unsupported_parameter; no se ignora |
+| `error.media-type` | 5.4 | DEBE | Los 4xx y 5xx con cuerpo van en application/problem+json |
+| `error.schema` | 5.4 | DEBE | El cuerpo de error cumple el esquema problem.json |
+| `error.status` | 5.4 | DEBE | El status del cuerpo es el de la respuesta |
+| `error.code` | 5.4 | DEBE | code sale de la tabla para ese estado, del registro de la IANA o es http_NNN |
+| `error.type` | 5.4 | DEBERÍA | type es la URI de error de Restep para ese code, otra URI o about:blank |
+| `error.detail` | 5.4 | DEBERÍA | Los errores llevan detail |
+| `error.401` | 5.4 | DEBE | Un 401 lleva WWW-Authenticate |
+| `error.405` | 5.1 | DEBE | Un 405 lleva Allow |
+| `error.retry-after` | 5.4 | DEBERÍA | Un 429, un 503 o un 409 request_in_progress (7.1) llevan Retry-After |
+| `error.parameter` | 5.3 | DEBE | invalid_parameter y unsupported_parameter nombran en parameter el parámetro tal como llegó |
+| `error.reason` | 5.4 | DEBE | reason sigue la gramática de los nombres y, si el descubrimiento declara reasons, es una de ellas con su code |
+| `cache-private.auth` | 5.1 | DEBE | Un 401 o un 403 es private o no-store |
+| `no-error-in-200` | 5.4 | DEBE | Ningún objeto problem dentro de un 2xx |
+| `deprecation` | 5.5 | DEBE | Lo que el descubrimiento retira lleva Deprecation y un Link rel="deprecation" (y Sunset si es un recurso, una acción o la versión); pasada la fecha, ya no funciona |
+| `singleton` | 5.9 | DEBE | Un singleton responde a GET con un objeto JSON, y a POST y DELETE con 405 |
+| `sync.undeclared` | 10 | DEBE | :changes en una colección que no declara sync da 404 |
+| `events` | 10 | DEBE | La respuesta de events lleva Cache-Control: no-store |
+| `item.discovery` | 4.2 | DEBE | Los elementos encajan con el descubrimiento: tipos declarados, mapas de idioma, relaciones y herencia |
+| `relations.link` | 9 | DEBE | Un enlace de una relación a varias colecciones lleva type (una de ellas), y uno a un elemento de una subcolección lleva href, la ruta de ese elemento |
+| `relations.include` | 9 | DEBE | include de una relación no declarada, no expandible, más honda que include_depth o que sigue tras una relación a varias colecciones da unsupported_parameter |
+| `relations.fields` | 9 | DEBE | Una ruta con punto en fields cuya relación no está en include da invalid_parameter |
+| `actions.listed` | 11.1 | DEBE | Cada acción de _actions está declarada en la colección, de elemento y con el mismo método |
+| `actions.undeclared` | 11.1 | DEBE | Una acción no declarada, o declarada en el otro tipo de recurso, da 404; con otro método, 405 |
+| `actions.response` | 11.1 | DEBE | Una acción responde 200 (el recurso afectado), 201 con Location (uno nuevo) o 204 |
+| `actions.empty-body` | 11.1 | DEBE | Una acción con POST trata el cuerpo vacío, con o sin Content-Type, como {}: nunca da 400 ni 415 por él |
+| `query.declared-rejected` | 5.3 | DEBE | Un filtro, orden o recuento declarados no se rechazan con unsupported_parameter |
+| `query.named-value` | 6.1 | DEBE | Un interruptor con valor, o un filtro con nombre con type sin valor o con uno que no encaja, dan invalid_parameter |
+| `query.undeclared` | 5.3 | DEBE | Un campo u operador de filtro o un campo de orden no declarados dan unsupported_parameter |
+| `filter.match` | 6.1 | DEBE | Cada elemento devuelto cumple los filtros, comparando según el tipo declarado |
+| `sort.order` | 6.2 | DEBE | Los elementos vienen en el orden pedido, con los que no tienen valor al final |
+| `fields` | 6.3 | DEBE | Con fields solo vienen esos campos, id y los miembros que empiezan por _ |
+| `limit` | 6.4 | DEBE | Una página no pasa de limit, y un limit fuera de 1..max_limit da invalid_parameter |
+| `next` | 6.4 | DEBE | next lleva cursor y conserva sin cambios los demás parámetros |
+| `count` | 6.5 | DEBE | count=true añade total, un entero; con count exact, sin total_estimated |
+| `idempotency.key` | 7.1 | DEBE | Una Idempotency-Key mal formada da 400 bad_request; con "anonymous": false, también una sin credenciales (salvo en una acción idempotente, que la ignora); una acción idempotente no rechaza una bien formada |
+| `idempotency.replay` | 7.1 | DEBE | La misma petición con la misma Idempotency-Key devuelve el mismo estado y el mismo cuerpo |
+| `idempotency.replayed-header` | 7.1 | DEBERÍA | Una repetición lleva Idempotent-Replayed: true |
+| `idempotency.mismatch` | 7.1 | DEBE | La misma Idempotency-Key con otra petición no tiene éxito (422 idempotency_mismatch) |
+| `etag` | 7.2 | DEBE | El GET de un elemento completo lleva su ETag fuerte, y toda respuesta cuyo cuerpo es un elemento lleva _etag |
+| `etag.collection` | 7.2 | DEBERÍA | Los elementos de una colección llevan _etag cuando admiten PATCH o DELETE |
+| `etag.synced` | 7.2 | DEBE | En una colección que declara sync, todo elemento que admite PATCH o DELETE lleva _etag en todas las páginas |
+| `if-match` | 7.2 | DEBE | If-Match con una ETag antigua da 412; con la vigente, no; una escritura a un elemento recién borrado da 404, no 412 |
+| `precondition` | 7.2 | DEBE | Un 412 responde a una cabecera condicional y un 428 a una escritura sin If-Match |
+| `if-none-match` | 8 | DEBE | If-None-Match que coincide da 304 a GET y HEAD (cache) y 412 a una escritura (writes) |
+| `cache-control` | 8 | DEBE | Con cache, toda respuesta a GET o HEAD, también de error, lleva Cache-Control |
+| `cache-etag` | 8 | DEBE | Con cache, el GET de un elemento completo o de un singleton lleva ETag |
+| `cache-private` | 5.1 | DEBE | Una respuesta a una petición con credenciales es private o no-store |
+| `minimal.etag` | 7.3 | DEBE | Una respuesta mínima a una escritura que no borra lleva la ETag del elemento |
+| `minimal` | 7.3 | DEBERÍA | Una respuesta mínima lleva Preference-Applied |
 
 Las comprobaciones que comparan peticiones entre sí (`if-match`, `if-none-match` en escrituras,
 `idempotency.*`) usan lo que el proxy ha aprendido del tráfico: la última ETag de cada elemento y
@@ -135,10 +165,18 @@ node tools/restep-proxy/test.mjs etag       # solo las mutaciones cuyo nombre co
 Arranca el servidor de referencia en el puerto 8871 y el proxy en el 8870, manda tráfico variado
 (descubrimiento, status, filtros, orden, paginación, `fields`, recuento, errores, escrituras con
 `If-Match`, `If-None-Match`, `Idempotency-Key` y `Prefer`), con y sin `RESTEP_TOKEN`, y exige 0
-violaciones y 0 avisos. Después repite el mismo tráfico contra 42 copias mutadas del servidor en un
-directorio temporal, y cada una tiene que hacer saltar la comprobación que la cubre. También
+violaciones y 0 avisos. El tráfico incluye lo del borrador 6: un `POST` como `text/plain`, un cuerpo
+vacío, un `PATCH` de otro tipo, altas con y sin `id` en `categories` (`id_from: "either"`), un `id`
+repetido, el singleton `shop` (con `fields`, `include`, `POST` y `DELETE`), una escritura a un
+elemento recién borrado y la misma `Idempotency-Key` con otra query; y de `relations` y `actions`,
+que la referencia anuncia: `include` declarado, demasiado hondo o polimórfico, `fields` con punto
+con y sin `include`, la subcolección `/books/{book_id}/reviews` y un enlace con `href`, y acciones
+de elemento y de colección (con `input`, con el cuerpo vacío, `GET`, no declarada, en el otro tipo
+de recurso, con otro método). Después repite el mismo tráfico contra 70 copias mutadas del servidor en un directorio temporal, y cada una tiene que hacer
+saltar la comprobación que la cubre. También
 prueba `--strict`, la página HTML, el código de salida, las cabeceras hop-by-hop, el flujo y gzip
-(con un servidor auxiliar en el 8872; `--strict` usa el 8873).
+(con un servidor auxiliar en el 8872, que también da un `409 request_in_progress` sin
+`Retry-After`; `--strict` usa el 8873).
 
 ## Límites
 
@@ -146,33 +184,45 @@ prueba `--strict`, la página HTML, el código de salida, las cabeceras hop-by-h
 - No analiza el cuerpo de los flujos SSE ni de los cuerpos mayores que `--max-body`.
 - Lo aprendido del tráfico (ETags, claves) solo ve lo que pasa por el proxy: si otro cliente
   escribe directamente en la API, `if-match` puede tomar por antigua una ETag que ya no lo es.
-- No comprueba `relations` (`include`), `sync`, `batch`, `actions`, `filter-expr` ni
-  `query-method` más allá de lo pasivo (formato de errores, cabeceras), ni `Accept-Language`/`Vary`
-  (§5.6), ni la paginación completa (sin repetidos ni huecos), que necesita recorrerla entera:
-  eso lo hace `restep-check`.
+- De `relations` comprueba los enlaces (`type`, `href`), qué `include` se acepta y `fields` con
+  punto; no que `include` rellene el objeto (un relacionado que el cliente no puede ver se queda en
+  su `id`, y el proxy no sabe cuál es), ni que el `href` lleve a un elemento que existe. De
+  `actions`, `_actions`, la respuesta, el `404` y el `405`, el cuerpo vacío y `Idempotency-Key` en
+  las idempotentes; no el `422` frente a `input`, ni que `_actions` liste solo lo disponible en el
+  estado del elemento. No comprueba `batch`, `filter-expr` ni `query-method` más allá de lo pasivo
+  (formato de errores, cabeceras), ni `Accept-Language`/`Vary` (§5.6), ni la paginación completa (sin repetidos ni
+  huecos), que necesita recorrerla entera: eso lo hace `restep-check`. De `sync` solo mira que
+  `:changes` dé `404` en una colección sin `sync`, el `_etag` de las sincronizadas y el
+  `Cache-Control` de `events`; no el contenido de `:changes` ni los eventos.
+- Del borrador 6 no comprueba: que el descubrimiento sea el mismo para todos los principales
+  (§4.2), la gramática de los nombres que declara (§3), el orden de los errores (§5.4) salvo los
+  casos de arriba, `If-Match` en un `POST` a una colección (§7.2), los grupos de caché (§8), la
+  comprobación de `Origin` de §5.8, el `href` de las relaciones de un singleton ni que un `429` o
+  `503` llegue solo a peticiones sin efecto (§5.7). La mayoría las prueba `restep-check`.
 - `restep-check` no exporta funciones, así que las piezas que comparten (tabla de códigos,
   comparación tipada de 6.1, enlaces) están copiadas; `problem.json` también, y la prueba
   comprueba que la copia coincide con el publicado.
 
 ## Dudas sobre la spec
 
-- **§7.1, destino de una clave.** «Una clave es […] de un destino (método y ruta)». ¿La ruta
-  incluye la query? El proxy la incluye; el servidor de referencia usa solo la ruta.
-- **§6.4, `next` «sin cambios».** El servidor de referencia vuelve a codificar los parámetros
-  (`filter[price]` sale como `filter%5Bprice%5D`). El proxy compara los valores descodificados; no
-  está claro si recodificar cuenta como cambiarlos.
-- **§7.2 y 7.4, ETag de un `201` completo.** 7.4 dice que un `201` mínimo lleva `ETag`, pero no
-  dice si la `ETag` de un `201` con cuerpo es la ETag de elemento. El proxy lo supone para aprender
-  la ETag vigente.
-- **§7.4, `ETag` en la respuesta mínima.** «PUEDEN responder sin cuerpo: `201` con `Location` y
-  `ETag`» no dice si `ETag` es obligatoria cuando se responde así. El proxy lo trata como DEBERÍA.
-- **§5.5, qué es «usar» un campo retirado.** Para `filter`, `sort`, `method` o `collection` está
-  claro; para `field` no (¿una respuesta que lo contiene?, ¿una escritura que lo envía?). El proxy
-  no comprueba `kind: "field"`.
-- **§7.3, «depende de las credenciales».** El proxy solo cuenta `Authorization`. ¿Cuentan las
-  cookies o un certificado de cliente?
+El borrador 6 resolvió varias del 5: el destino de una clave no incluye la query, pero la query
+cuenta para «la misma petición» (§7.1); recodificar `next` no es cambiarlo (§5.2); la `ETag` de una
+respuesta mínima es obligatoria (§7.3); y qué es «usar» un campo retirado (§5.5: toda respuesta que
+lo lleva y toda petición que lo nombra en un parámetro). Quedan estas:
+
+- **§7.2 y 7.3, ETag de un `201` completo.** §7.3 exige la `ETag` del elemento en una respuesta
+  mínima, pero no dice si la cabecera `ETag` de un `201` con cuerpo es la ETag de elemento (sí su
+  `_etag`). El proxy aprende la del `_etag` y, si no hay, la de la cabecera.
+- **§5.1, «depende de las credenciales».** El proxy solo cuenta `Authorization` para exigir
+  `private` o `no-store` en una lectura; no puede saber si la respuesta cambia con ellas, así que
+  exige más de lo que dice el texto («una respuesta que depende de credenciales»).
 - **§7.2, `HEAD` de un elemento.** Solo se exige la ETag al `GET`; por el RFC 9110 el `HEAD`
   DEBERÍA llevar las mismas cabeceras. El proxy no lo comprueba.
+- **§5.5, «usar» una relación retirada.** ¿Es solo `include`, o también un filtro u orden por una
+  ruta con punto que pasa por ella? El proxy cuenta las dos cosas.
+- **§3, cuerpo vacío en un `PATCH`.** §3 dice que un cuerpo vacío con `application/json` da `400`
+  en un `POST` o un `QUERY`; para el `PATCH` remite a §5.1, que solo dice que un parche que no es un
+  objeto da `400`. El proxy trata el vacío igual que un parche que no es objeto.
 
 ## Código y avisos
 

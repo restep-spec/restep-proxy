@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // restep-proxy · Proxy HTTP inverso que vigila el contrato Restep 1 en tráfico real.
-// Node 18 o posterior, sin dependencias.  Especificación: https://restep.wubytes.com/1/  (borrador 4)
+// Node 18 o posterior, sin dependencias.  Especificación: https://restep.wubytes.com/1/  (borrador 6)
 //
 //   node restep-proxy.mjs --target http://api:8080 --port 8871 [--report report.json] [--strict]
 //
@@ -18,26 +18,40 @@ import { writeFileSync, renameSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
 
-export const VERSION = '0.1.0';
-const SPEC = 'https://restep.wubytes.com/1/';
+export const VERSION = '0.2.0';
+const PROFILE = 'https://w3id.org/restep/1/'; // identificador: enlace de perfil y tipos de error
+const SPEC = 'https://restep.wubytes.com/1/'; // la página para leer
+// §1.2: las versiones cuyo texto de las partes experimentales (sync, inherit…) implementa este proxy.
+export const KNOWN_TEXTS = ['1.0-draft.6'];
+// §1.1: la gramática de restep, sin ceros a la izquierda.
+const RESTEP_VERSION = /^(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-(draft|rc)\.(0|[1-9]\d*))?$/;
+// §3: la gramática de los nombres (reason, entre otros).
+const NAME = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
 const ANCHORS = {
-  3: 'data', 4.1: 'profile-header', 4.2: 'discovery', 4.3: 'describing', 4.4: 'health', 5.1: 'resources', 5.2: 'collections',
-  5.3: 'reserved', 5.4: 'errors', 5.5: 'versions', 5.7: 'inheritance', 6.1: 'filters', 6.2: 'sorting', 6.3: 'fields',
-  6.4: 'pagination', 6.5: 'counts', 7.1: 'idempotency', 7.2: 'concurrency', 7.3: 'caching', 7.4: 'minimal',
+  1.1: 'restep-versions', 3: 'data', 4.1: 'profile-header', 4.2: 'discovery', 4.3: 'describing', 4.4: 'health', 5.1: 'resources',
+  5.2: 'collections', 5.3: 'reserved', 5.4: 'errors', 5.5: 'versions', 5.9: 'singletons', 6.1: 'filters', 6.2: 'sorting',
+  6.3: 'fields', 6.4: 'pagination', 6.5: 'counts', 7.1: 'idempotency', 7.2: 'concurrency', 7.3: 'minimal', 8: 'cache',
+  9: 'relations', 10: 'sync', 11.1: 'actions', 11.6: 'inheritance',
 };
-const sectionUrl = (s) => `${SPEC}#${ANCHORS[s] ?? 'conformance'}`;
+// Comprobaciones cuyo requisito tiene ancla propia dentro de su apartado.
+const CHECK_ANCHORS = { 'cache-private': 'private-responses', 'cache-private.auth': 'private-responses' };
+export const sectionUrl = (s, id) => `${SPEC}#${CHECK_ANCHORS[id] ?? ANCHORS[s] ?? 'conformance'}`;
 
 // ── Catálogo: cada comprobación, su apartado, su nivel y qué verifica ─────────
 // Un DEBE incumplido es una violación; un DEBERÍA, un aviso. --strict solo actúa con las violaciones.
 export const CHECKS = {
   json: ['3', 'DEBE', 'Un cuerpo JSON es JSON válido en UTF-8'],
-  links: ['3', 'DEBE', 'next y href son URI absolutas o rutas absolutas bajo la raíz de la API'],
-  'profile-link': ['4.1', 'DEBERÍA', 'Cada respuesta lleva un enlace rel="profile" por perfil y extensión anunciados'],
+  'json-type': ['3', 'DEBE', 'Un 2xx con cuerpo lleva Content-Type: application/json (un esquema puede ir como application/schema+json)'],
+  'media-type': ['3', 'DEBE', 'Un POST o QUERY con cuerpo sin Content-Type, de otro tipo o con un charset que no es UTF-8, o un PATCH de otro tipo, da 415; un cuerpo vacío con application/json da 400'],
+  'media-type.accept-patch': ['5.1', 'DEBERÍA', 'Un 415 a un PATCH lleva Accept-Patch'],
+  links: ['3', 'DEBE', 'next y href son URI absolutas o rutas absolutas bajo la raíz de la API, y una URI absoluta (también en Location y Link) usa https o el esquema de la raíz'],
+  'discovery.version': ['1.1', 'DEBE', 'El restep del descubrimiento sigue la gramática mayor.menor[-draft.N|-rc.N] y es de Restep 1'],
+  'profile-link': ['4.1', 'DEBERÍA', 'Cada respuesta lleva un único enlace rel="profile", a la URI de la versión'],
   health: ['4.4', 'DEBE', 'El recurso de status responde 200 o 503 con Cache-Control: no-store (o 401, 403, 429)'],
   allow: ['4.3', 'DEBE', 'Un 405 nombra en Allow los métodos declarados y ninguno más; un método declarado nunca da 405'],
   'status.success': ['5.1', 'DEBE', 'Éxitos con el estado de la tabla: GET 200, POST 201, PATCH 200 (204 con return=minimal), DELETE 204'],
   location: ['5.1', 'DEBE', 'Un 201 lleva Location con la ruta del elemento: la de su colección, / y su id'],
-  'id.assigned': ['5.1', 'DEBE', 'Un POST con id o un PATCH con otro id dan 422, no éxito'],
+  'id.assigned': ['5.1', 'DEBE', 'Un PATCH con otro id da 422; un POST con id, donde id_from no lo permite, también; y sin id, donde id_from es "client"'],
   'patch.object': ['5.1', 'DEBE', 'Un parche que no es un objeto JSON da 400, no éxito'],
   'collection.shape': ['5.2', 'DEBE', 'Una colección responde {items, next}, con next presente (cadena o null)'],
   reserved: ['5.3', 'DEBE', 'Un parámetro reservado que el recurso no implementa da 400 unsupported_parameter; no se ignora'],
@@ -49,12 +63,25 @@ export const CHECKS = {
   'error.detail': ['5.4', 'DEBERÍA', 'Los errores llevan detail'],
   'error.401': ['5.4', 'DEBE', 'Un 401 lleva WWW-Authenticate'],
   'error.405': ['5.1', 'DEBE', 'Un 405 lleva Allow'],
-  'error.retry-after': ['5.4', 'DEBERÍA', 'Un 429 o un 503 llevan Retry-After'],
+  'error.retry-after': ['5.4', 'DEBERÍA', 'Un 429, un 503 o un 409 request_in_progress (7.1) llevan Retry-After'],
   'error.parameter': ['5.3', 'DEBE', 'invalid_parameter y unsupported_parameter nombran en parameter el parámetro tal como llegó'],
+  'error.reason': ['5.4', 'DEBE', 'reason sigue la gramática de los nombres y, si el descubrimiento declara reasons, es una de ellas con su code'],
+  'cache-private.auth': ['5.1', 'DEBE', 'Un 401 o un 403 es private o no-store'],
   'no-error-in-200': ['5.4', 'DEBE', 'Ningún objeto problem dentro de un 2xx'],
-  deprecation: ['5.5', 'DEBE', 'Lo que el descubrimiento retira lleva Deprecation (y Sunset); pasada la fecha, ya no funciona'],
+  deprecation: ['5.5', 'DEBE', 'Lo que el descubrimiento retira lleva Deprecation y un Link rel="deprecation" (y Sunset si es un recurso, una acción o la versión); pasada la fecha, ya no funciona'],
+  singleton: ['5.9', 'DEBE', 'Un singleton responde a GET con un objeto JSON, y a POST y DELETE con 405'],
+  'sync.undeclared': ['10', 'DEBE', ':changes en una colección que no declara sync da 404'],
+  events: ['10', 'DEBE', 'La respuesta de events lleva Cache-Control: no-store'],
   'item.discovery': ['4.2', 'DEBE', 'Los elementos encajan con el descubrimiento: tipos declarados, mapas de idioma, relaciones y herencia'],
+  'relations.link': ['9', 'DEBE', 'Un enlace de una relación a varias colecciones lleva type (una de ellas), y uno a un elemento de una subcolección lleva href, la ruta de ese elemento'],
+  'relations.include': ['9', 'DEBE', 'include de una relación no declarada, no expandible, más honda que include_depth o que sigue tras una relación a varias colecciones da unsupported_parameter'],
+  'relations.fields': ['9', 'DEBE', 'Una ruta con punto en fields cuya relación no está en include da invalid_parameter'],
+  'actions.listed': ['11.1', 'DEBE', 'Cada acción de _actions está declarada en la colección, de elemento y con el mismo método'],
+  'actions.undeclared': ['11.1', 'DEBE', 'Una acción no declarada, o declarada en el otro tipo de recurso, da 404; con otro método, 405'],
+  'actions.response': ['11.1', 'DEBE', 'Una acción responde 200 (el recurso afectado), 201 con Location (uno nuevo) o 204'],
+  'actions.empty-body': ['11.1', 'DEBE', 'Una acción con POST trata el cuerpo vacío, con o sin Content-Type, como {}: nunca da 400 ni 415 por él'],
   'query.declared-rejected': ['5.3', 'DEBE', 'Un filtro, orden o recuento declarados no se rechazan con unsupported_parameter'],
+  'query.named-value': ['6.1', 'DEBE', 'Un interruptor con valor, o un filtro con nombre con type sin valor o con uno que no encaja, dan invalid_parameter'],
   'query.undeclared': ['5.3', 'DEBE', 'Un campo u operador de filtro o un campo de orden no declarados dan unsupported_parameter'],
   'filter.match': ['6.1', 'DEBE', 'Cada elemento devuelto cumple los filtros, comparando según el tipo declarado'],
   'sort.order': ['6.2', 'DEBE', 'Los elementos vienen en el orden pedido, con los que no tienen valor al final'],
@@ -62,58 +89,162 @@ export const CHECKS = {
   limit: ['6.4', 'DEBE', 'Una página no pasa de limit, y un limit fuera de 1..max_limit da invalid_parameter'],
   next: ['6.4', 'DEBE', 'next lleva cursor y conserva sin cambios los demás parámetros'],
   count: ['6.5', 'DEBE', 'count=true añade total, un entero; con count exact, sin total_estimated'],
-  'idempotency.key': ['7.1', 'DEBE', 'Una Idempotency-Key mal formada da 400 bad_request'],
+  'idempotency.key': ['7.1', 'DEBE', 'Una Idempotency-Key mal formada da 400 bad_request; con "anonymous": false, también una sin credenciales (salvo en una acción idempotente, que la ignora); una acción idempotente no rechaza una bien formada'],
   'idempotency.replay': ['7.1', 'DEBE', 'La misma petición con la misma Idempotency-Key devuelve el mismo estado y el mismo cuerpo'],
   'idempotency.replayed-header': ['7.1', 'DEBERÍA', 'Una repetición lleva Idempotent-Replayed: true'],
   'idempotency.mismatch': ['7.1', 'DEBE', 'La misma Idempotency-Key con otra petición no tiene éxito (422 idempotency_mismatch)'],
-  etag: ['7.2', 'DEBE', 'El GET de un elemento lleva su ETag fuerte o, con fields o codificación, _etag'],
-  'if-match': ['7.2', 'DEBE', 'If-Match con una ETag antigua da 412; con la vigente, no'],
+  etag: ['7.2', 'DEBE', 'El GET de un elemento completo lleva su ETag fuerte, y toda respuesta cuyo cuerpo es un elemento lleva _etag'],
+  'etag.collection': ['7.2', 'DEBERÍA', 'Los elementos de una colección llevan _etag cuando admiten PATCH o DELETE'],
+  'etag.synced': ['7.2', 'DEBE', 'En una colección que declara sync, todo elemento que admite PATCH o DELETE lleva _etag en todas las páginas'],
+  'if-match': ['7.2', 'DEBE', 'If-Match con una ETag antigua da 412; con la vigente, no; una escritura a un elemento recién borrado da 404, no 412'],
   precondition: ['7.2', 'DEBE', 'Un 412 responde a una cabecera condicional y un 428 a una escritura sin If-Match'],
-  'if-none-match': ['7.3', 'DEBE', 'If-None-Match que coincide da 304 a GET y HEAD y 412 a una escritura'],
-  'cache-control': ['7.3', 'DEBE', 'Toda respuesta a GET o HEAD, también de error, lleva Cache-Control'],
-  'cache-private': ['7.3', 'DEBE', 'Una respuesta a una petición con credenciales es private o no-store'],
-  minimal: ['7.4', 'DEBERÍA', 'Una respuesta mínima lleva ETag (y Location si es 201) y Preference-Applied'],
+  'if-none-match': ['8', 'DEBE', 'If-None-Match que coincide da 304 a GET y HEAD (cache) y 412 a una escritura (writes)'],
+  'cache-control': ['8', 'DEBE', 'Con cache, toda respuesta a GET o HEAD, también de error, lleva Cache-Control'],
+  'cache-etag': ['8', 'DEBE', 'Con cache, el GET de un elemento completo o de un singleton lleva ETag'],
+  'cache-private': ['5.1', 'DEBE', 'Una respuesta a una petición con credenciales es private o no-store'],
+  'minimal.etag': ['7.3', 'DEBE', 'Una respuesta mínima a una escritura que no borra lleva la ETag del elemento'],
+  minimal: ['7.3', 'DEBERÍA', 'Una respuesta mínima lleva Preference-Applied'],
 };
 
 // ── Esquema de errores (schema/problem.json, copiado tal cual; test.mjs comprueba que coincide) ──
 export const PROBLEM_SCHEMA = {
-  $schema: 'https://json-schema.org/draft/2020-12/schema',
-  $id: 'https://restep.wubytes.com/1/schema/problem.json',
-  title: 'Restep 1 error',
-  description: 'Body of every 4xx or 5xx response: application/problem+json (RFC 9457) with a code (section 5.4). Whether code fits the status is checked by restep-check, not by this schema.',
-  type: 'object',
-  required: ['type', 'title', 'status', 'code'],
-  properties: {
-    type: { type: 'string', format: 'uri-reference', examples: ['https://restep.wubytes.com/1/errors#invalid', 'about:blank'] },
-    title: { type: 'string' },
-    status: { type: 'integer', minimum: 400, maximum: 599 },
-    code: {
-      type: 'string', pattern: '^[a-z][a-z0-9_]*$',
-      examples: ['bad_request', 'invalid_parameter', 'unsupported_parameter', 'idempotency_key_required', 'unauthenticated',
-        'forbidden', 'not_found', 'method_not_allowed', 'not_acceptable', 'conflict', 'state_expired', 'retired',
-        'precondition_failed', 'content_too_large', 'uri_too_long', 'unsupported_media_type', 'invalid',
-        'idempotency_mismatch', 'not_executed', 'precondition_required', 'rate_limited', 'internal', 'not_implemented',
-        'unavailable'],
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://w3id.org/restep/1/schema/problem.json",
+  "title": "Restep 1 error",
+  "description": "Body of every 4xx or 5xx response: application/problem+json (RFC 9457) with a code (section 5.4), and of every error result in a batch (11.2). Whether code fits the status, and whether reason is declared in discovery, is checked by restep-check, not by this schema.",
+  "type": "object",
+  "required": [
+    "type",
+    "title",
+    "status",
+    "code"
+  ],
+  "properties": {
+    "type": {
+      "type": "string",
+      "format": "uri-reference",
+      "examples": [
+        "https://w3id.org/restep/1/errors#invalid",
+        "about:blank"
+      ]
     },
-    detail: { type: 'string' },
-    instance: { type: 'string', format: 'uri-reference' },
-    reason: { type: 'string', pattern: '^[a-z][a-z0-9_]*$', description: 'Domain reason defined by the API (5.4).' },
-    parameter: { type: 'string', description: 'The parameter name as received, after percent-decoding (5.3).' },
-    errors: {
-      type: 'array',
-      items: {
-        type: 'object', required: ['code'],
-        properties: {
-          pointer: { type: 'string', pattern: '^(/.*)?$', description: 'JSON Pointer into the request body (RFC 6901).' },
-          parameter: { type: 'string' },
-          header: { type: 'string' },
-          code: { type: 'string', examples: ['required', 'type', 'format', 'range', 'too_long', 'unknown', 'read_only'] },
-          detail: { type: 'string' },
+    "title": {
+      "type": "string"
+    },
+    "status": {
+      "type": "integer",
+      "minimum": 400,
+      "maximum": 599
+    },
+    "code": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*$",
+      "description": "From the table of 5.4, or the status's IANA description in snake_case, or http_ and the number for an unregistered status.",
+      "examples": [
+        "bad_request",
+        "invalid_parameter",
+        "unsupported_parameter",
+        "idempotency_key_required",
+        "unauthenticated",
+        "forbidden",
+        "not_found",
+        "method_not_allowed",
+        "not_acceptable",
+        "conflict",
+        "request_in_progress",
+        "state_expired",
+        "retired",
+        "precondition_failed",
+        "content_too_large",
+        "uri_too_long",
+        "unsupported_media_type",
+        "invalid",
+        "idempotency_mismatch",
+        "not_executed",
+        "precondition_required",
+        "rate_limited",
+        "internal",
+        "not_implemented",
+        "unavailable",
+        "bad_gateway",
+        "http_499"
+      ]
+    },
+    "detail": {
+      "type": "string"
+    },
+    "instance": {
+      "type": "string",
+      "format": "uri-reference"
+    },
+    "reason": {
+      "type": "string",
+      "pattern": "^[A-Za-z][A-Za-z0-9_-]{0,63}$",
+      "description": "Domain reason defined by the API: follows the grammar of names (3) and should be snake_case (5.4)."
+    },
+    "parameter": {
+      "type": "string",
+      "description": "The parameter name as received, after percent-decoding (5.3); also on a 403 for a field the principal can read in no item (6.1)."
+    },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "code"
+        ],
+        "properties": {
+          "pointer": {
+            "type": "string",
+            "pattern": "^(/.*)?$",
+            "description": "JSON Pointer into the request body, plain string form (RFC 6901)."
+          },
+          "parameter": {
+            "type": "string"
+          },
+          "header": {
+            "type": "string",
+            "examples": [
+              "Idempotency-Key"
+            ]
+          },
+          "code": {
+            "type": "string",
+            "examples": [
+              "required",
+              "type",
+              "format",
+              "range",
+              "too_long",
+              "unknown",
+              "read_only",
+              "taken"
+            ]
+          },
+          "detail": {
+            "type": "string"
+          }
         },
-        anyOf: [{ required: ['pointer'] }, { required: ['parameter'] }, { required: ['header'] }],
-      },
-    },
-  },
+        "anyOf": [
+          {
+            "required": [
+              "pointer"
+            ]
+          },
+          {
+            "required": [
+              "parameter"
+            ]
+          },
+          {
+            "required": [
+              "header"
+            ]
+          }
+        ]
+      }
+    }
+  }
 };
 
 // Validador mínimo de JSON Schema: solo lo que usa problem.json (type, required, properties, pattern,
@@ -147,7 +278,7 @@ export function schemaErrors(schema, v, at = '') {
 // ── Utilidades compartidas con restep-check (copiadas: restep-check no exporta nada) ──
 const TABLE = {
   400: ['bad_request', 'invalid_parameter', 'unsupported_parameter', 'idempotency_key_required'], 401: ['unauthenticated'],
-  403: ['forbidden'], 404: ['not_found'], 405: ['method_not_allowed'], 406: ['not_acceptable'], 409: ['conflict'],
+  403: ['forbidden'], 404: ['not_found'], 405: ['method_not_allowed'], 406: ['not_acceptable'], 409: ['conflict', 'request_in_progress'],
   410: ['state_expired', 'retired'], 412: ['precondition_failed'], 413: ['content_too_large'], 414: ['uri_too_long'],
   415: ['unsupported_media_type'], 422: ['invalid', 'idempotency_mismatch'], 424: ['not_executed'],
   428: ['precondition_required'], 429: ['rate_limited'], 500: ['internal'], 501: ['not_implemented'], 503: ['unavailable'],
@@ -314,13 +445,16 @@ function usage(msg) { console.error(`${msg}\n\n${HELP}`); process.exit(2); }
 let opts, target, rootPath;
 let disc = null; // documento de descubrimiento vigente
 let announced = ['core'];
+let knownText = false; // §1.2: si se conoce el texto de las partes experimentales de la versión declarada
 let routes = []; // colecciones del descubrimiento, con sus expresiones regulares
+let singletonRoutes = new Map(); // ruta completa → { name, c } de cada singleton (§5.9)
 const stats = { started: new Date(), exchanges: 0, analysed: 0, byClass: {}, upstreamErrors: 0, replaced: 0 };
 const groups = new Map(); // comprobación + método + ruta → grupo
 const etags = new Map(); // ruta de elemento → { current, old: Set }
 const writeSeq = new Map(); // ruta → escrituras empezadas
 const inflight = new Map(); // ruta → escrituras en curso
 const idem = new Map(); // ámbito de Idempotency-Key → { print, status, body, replay, expires, pending }
+const deleted = new Set(); // rutas de elementos que el proxy ha visto borrar (§7.2: una escritura después da 404)
 
 const has = (p) => announced.includes(p);
 const joinRoot = (p) => {
@@ -329,10 +463,17 @@ const joinRoot = (p) => {
 };
 const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
+// §1.1: un documento cuyo restep no sigue la gramática, o de otra versión mayor, no es de Restep 1.
+const restep1 = (doc) => { const v = RESTEP_VERSION.exec(doc?.restep ?? ''); return !!v && v[1] === '1'; };
 function setDiscovery(doc) {
   disc = doc;
+  knownText = KNOWN_TEXTS.includes(doc.restep);
   announced = ['core', ...(Array.isArray(doc.profiles) ? doc.profiles : []), ...(Array.isArray(doc.extensions) ? doc.extensions : [])]
     .filter((p, i, a) => typeof p === 'string' && a.indexOf(p) === i);
+  // §5.9: un singleton con plantilla o con parent se ignora.
+  singletonRoutes = new Map();
+  for (const [name, c] of Object.entries(isObject(doc.singletons) ? doc.singletons : {}))
+    if (isObject(c) && typeof c.path === 'string' && !/[{}]/.test(c.path) && c.parent === undefined) singletonRoutes.set(joinRoot(c.path).replace(/\/$/, ''), { name, c });
   routes = [];
   for (const [name, c] of Object.entries(isObject(doc.collections) ? doc.collections : {})) {
     if (!isObject(c) || typeof c.path !== 'string') continue;
@@ -349,12 +490,20 @@ function statusPath() {
   try { const u = new URL(disc.status, target); return u.origin === target.origin ? u.pathname : null; } catch { return null; }
 }
 const metadataPath = () => `/.well-known/oauth-protected-resource${rootPath === '/' ? '' : rootPath}`;
+// §10: events es relativo a la raíz de la API, como los path del descubrimiento.
+const eventsPath = () => (typeof disc?.events === 'string' ? joinRoot(disc.events) : null);
+// §10: una colección está sincronizada si declara sync con el perfil anunciado (y, al ser experimental, §1.2,
+// solo se juzga con un texto conocido).
+const synced = (c) => has('sync') && knownText && isObject(c?.sync);
 
 // Qué es una ruta: discovery, status, metadata (fuera de la API), collection, item, action u other.
 function classify(pathname) {
   if (pathname === rootPath || pathname === rootPath.replace(/\/$/, '')) return { kind: 'discovery', label: '/' };
   if (pathname === statusPath()) return { kind: 'status', label: pathname };
   if (pathname === metadataPath() || pathname.startsWith('/.well-known/')) return { kind: 'metadata', label: pathname };
+  if (pathname === eventsPath()) return { kind: 'events', label: pathname };
+  const single = singletonRoutes.get(pathname.replace(/\/$/, ''));
+  if (single) return { kind: 'singleton', r: single, label: single.c.path };
   for (const r of routes) {
     let m;
     if ((m = r.action.exec(pathname))) return { kind: 'action', r, id: m[1], action: m[2], label: `${r.label}${m[1] ? '/{id}' : ''}:${m[2]}` };
@@ -382,7 +531,7 @@ function record(ex, f) {
   const sample = { time: when, request: `${ex.method} ${ex.url}`, status: ex.status, message: f.msg };
   let g = groups.get(key);
   if (!g) {
-    g = { check: f.id, section, level, description: CHECKS[f.id][2], spec: sectionUrl(section), method: ex.method,
+    g = { check: f.id, section, level, description: CHECKS[f.id][2], spec: sectionUrl(section, f.id), method: ex.method,
       route: ex.route.label, count: 0, first: sample, last: sample };
     groups.set(key, g);
   }
@@ -429,6 +578,8 @@ function analyze(ex) {
 
   // 3: JSON válido.
   if (hasBody && isJsonType(mediaType(rh['content-type'])) && ex.bodyError) bad('json', ex.bodyError);
+  // §3: Location y Link, con https o el esquema de la raíz.
+  if (r.kind !== 'other') linkSchemes(ex, bad);
 
   // 4.4: el recurso de status, fuera de la API.
   if (r.kind === 'status') {
@@ -438,17 +589,33 @@ function analyze(ex) {
     return out;
   }
   if (r.kind === 'metadata') return out;
+  // §10: el flujo de eventos lleva Cache-Control: no-store.
+  if (r.kind === 'events') {
+    if (has('sync') && knownText && read && ok && !/\bno-store\b/i.test(rh['cache-control'] ?? '')) bad('events', `Cache-Control: ${rh['cache-control'] ?? '(ninguno)'}; se esperaba no-store`);
+    return out;
+  }
+  // §3: un 2xx con cuerpo es application/json (salvo un esquema); fuera de Restep (§5.9) no se exige.
+  if (ok && hasBody && r.kind !== 'other') {
+    const t = mediaType(rh['content-type']);
+    if (t !== 'application/json' && t !== 'application/schema+json') bad('json-type', `Content-Type: ${rh['content-type'] ?? '(ninguno)'}`);
+  }
+  mediaTypeChecks(ex, bad);
+  if (r.kind === 'discovery' && ok && isObject(d) && typeof d.restep === 'string' && !restep1(d))
+    bad('discovery.version', `restep es ${JSON.stringify(d.restep)}: no sigue mayor.menor[-draft.N|-rc.N] o no es Restep 1`);
 
   // 4.1: cabecera de perfil.
   if (s !== 304 && disc) {
     const links = linkTargets(rh.link, 'profile');
-    const missing = announced.filter((p) => !links.includes(`${SPEC}${p}`));
-    if (missing.length) bad('profile-link', `faltan enlaces de perfil: ${missing.join(', ')}`);
+    const extra = links.filter((u) => u.startsWith(PROFILE) && u !== PROFILE);
+    if (!links.includes(PROFILE)) bad('profile-link', `falta <${PROFILE}>; rel="profile"`);
+    else if (extra.length) bad('profile-link', `lista perfiles en la cabecera (${extra.map((u) => u.slice(PROFILE.length)).join(', ')}): solo va la URI de la versión`);
   }
-  // 7.3: Cache-Control en toda respuesta a GET o HEAD; private o no-store con credenciales.
-  if (read && has('writes') && !rh['cache-control']) bad('cache-control', 'sin Cache-Control');
+  // 8: con cache, Cache-Control en toda respuesta a GET o HEAD. 5.1: private o no-store con credenciales, y en 401 y 403.
+  if (read && has('cache') && !rh['cache-control']) bad('cache-control', 'sin Cache-Control');
   if (read && q.authorization && rh['cache-control'] && !/\b(private|no-store)\b/i.test(rh['cache-control']))
     bad('cache-private', `petición con Authorization y Cache-Control: ${rh['cache-control']}`);
+  if ((s === 401 || s === 403) && !/\b(private|no-store)\b/i.test(rh['cache-control'] ?? ''))
+    bad('cache-private.auth', `${s} con Cache-Control: ${rh['cache-control'] ?? '(ninguno)'}`);
 
   if (s >= 400) errorChecks(ex, bad);
   else if (ok && isObject(d) && typeof d.code === 'string' && typeof d.type === 'string' && Number.isInteger(d.status) && d.status >= 400)
@@ -457,11 +624,18 @@ function analyze(ex) {
   if (r.kind === 'collection' || r.kind === 'item') {
     resourceChecks(ex, bad);
     reservedChecks(ex, bad);
+  } else if (r.kind === 'singleton') singletonChecks(ex, bad);
+  if (r.kind === 'collection' || r.kind === 'item' || r.kind === 'singleton') {
     if (has('writes')) writesChecks(ex, bad);
-  } else if (r.kind === 'discovery' && ok && [...ex.params].length) {
+    if (has('cache')) cacheChecks(ex, bad);
+  }
+  if (r.kind === 'action' && r.action !== 'changes' && has('actions')) actionChecks(ex, bad);
+  if (r.kind === 'action' && r.action === 'changes' && !r.id && ok && !synced(r.r.c) && has('sync') && knownText)
+    bad('sync.undeclared', `${r.r.name} no declara sync y :changes ha dado ${s}; se esperaba 404`);
+  if (r.kind === 'discovery' && ok && [...ex.params].length) {
     for (const k of new Set(ex.params.keys())) if (isReservedName(k)) bad('reserved', `${k} en la raíz se ha ignorado; se esperaba 400 unsupported_parameter`);
   }
-  if (has('writes') && ex.method === 'POST' && r.kind !== 'discovery') idempotencyChecks(ex, bad);
+  if (has('writes') && ex.method === 'POST' && (r.kind === 'collection' || r.kind === 'action')) idempotencyChecks(ex, bad);
   deprecationChecks(ex, bad);
   return out;
 }
@@ -469,11 +643,89 @@ function analyze(ex) {
 const baseName = (k) => k.replace(/\[.*$/, '');
 const isReservedName = (k) => RESERVED.includes(baseName(k)) || k.startsWith('$');
 
+// §3: una URI absoluta en Location o Link usa https o el esquema de la raíz de la API.
+function linkSchemes(ex, bad) {
+  const okScheme = (u) => { const m = /^([a-z][a-z0-9+.-]*):/i.exec(u); return !m || m[1].toLowerCase() === 'https' || `${m[1].toLowerCase()}:` === target.protocol; };
+  const loc = ex.resHeaders.location;
+  if (typeof loc === 'string' && !okScheme(loc)) bad('links', `Location: ${loc} no usa https ni el esquema de la raíz`);
+  for (const m of String(ex.resHeaders.link ?? '').matchAll(/<([^>]*)>/g)) if (!okScheme(m[1])) { bad('links', `Link con <${m[1]}>, que no usa https ni el esquema de la raíz`); break; }
+}
+
+// §3 y §5.1: el tipo de medio de los cuerpos de las peticiones. Solo se juzga un éxito que debía ser 415 o 400.
+function jsonMediaOk(header, types) {
+  if (header === undefined) return false;
+  const [type, ...params] = String(header).split(';');
+  if (!types.includes(type.trim().toLowerCase())) return false;
+  for (const p of params) {
+    const eq = p.indexOf('=');
+    if (eq < 0 || p.slice(0, eq).trim().toLowerCase() !== 'charset') continue;
+    let v = p.slice(eq + 1).trim();
+    if (v.length >= 2 && v.startsWith('"') && v.endsWith('"')) v = v.slice(1, -1);
+    if (v.toLowerCase() !== 'utf-8') return false;
+  }
+  return true;
+}
+function mediaTypeChecks(ex, bad) {
+  const r = ex.route, m = ex.method, s = ex.status, ok = s >= 200 && s < 300;
+  const ct = ex.reqHeaders['content-type'], empty = !ex.reqBody || ex.reqBody.length === 0;
+  if (m === 'PATCH' && (r.kind === 'item' || r.kind === 'singleton')) {
+    if (s === 415 && !ex.resHeaders['accept-patch']) bad('media-type.accept-patch', '415 a un PATCH sin Accept-Patch');
+    if (!ok) return;
+    if (!jsonMediaOk(ct, ['application/merge-patch+json', 'application/json'])) bad('media-type', `un PATCH con Content-Type: ${ct ?? '(ninguno)'} ha dado ${s}; se esperaba 415`);
+    else if (empty && ex.reqBody) bad('media-type', `un PATCH con el cuerpo vacío ha dado ${s}; se esperaba 400 bad_request`);
+    return;
+  }
+  const post = m === 'POST' && (r.kind === 'collection' || r.kind === 'action');
+  if (!ok || !(post || (m === 'QUERY' && r.kind === 'collection'))) return;
+  // §11.1: una acción con POST trata el cuerpo vacío, con o sin Content-Type, como {}.
+  if (r.kind === 'action' && empty) return;
+  if (!jsonMediaOk(ct, ['application/json'])) bad('media-type', `un ${m} con Content-Type: ${ct ?? '(ninguno)'} ha dado ${s}; se esperaba 415`);
+  else if (empty && ex.reqBody) bad('media-type', `un ${m} con el cuerpo vacío y application/json ha dado ${s}; se esperaba 400 bad_request`);
+}
+
+// §5.9: un singleton.
+function singletonChecks(ex, bad) {
+  const c = ex.route.r.c, p = ex.params, s = ex.status, ok = s >= 200 && s < 300, m = ex.method, d = ex.data;
+  const declared = Array.isArray(c.methods) ? c.methods : null;
+  if (s === 405 && declared && ex.resHeaders.allow) {
+    const allow = ex.resHeaders.allow.split(',').map((x) => x.trim().toUpperCase()).filter((x) => FOUR.includes(x));
+    const missing = declared.filter((x) => !allow.includes(x)), extra = allow.filter((x) => !declared.includes(x));
+    if (missing.length || extra.length) bad('allow', `Allow: ${ex.resHeaders.allow}; declarados ${declared.join(', ')}`);
+  }
+  if (s === 405 && declared?.includes(m === 'HEAD' ? 'GET' : m)) bad('allow', `${m} está declarado y ha dado 405`);
+  if (ok && (m === 'POST' || m === 'DELETE')) bad('singleton', `${m} a un singleton ha dado ${s}; se esperaba 405`);
+  if (ok && m === 'GET' && !isObject(d) && !ex.bodyError) bad('singleton', 'el GET del singleton no devuelve un objeto JSON');
+  // 5.3 y 5.9: en un singleton solo fields (con query, en GET y HEAD); el resto de reservados fallan en voz alta.
+  if (ok) for (const k of new Set(p.keys())) {
+    if (!isReservedName(k)) continue;
+    if (k === 'fields' && has('query') && (m === 'GET' || m === 'HEAD')) continue;
+    bad('reserved', `${k} se ha ignorado en un singleton; se esperaba 400 unsupported_parameter`);
+  }
+  if (ok && m === 'GET' && isObject(d) && once(p, 'fields') && has('query')) {
+    const allowed = new Set(['id', ...p.get('fields').split(',')]);
+    const extra = Object.keys(d).filter((k) => !allowed.has(k) && !k.startsWith('_'));
+    if (extra.length) bad('fields', `fields=${p.get('fields')} y el singleton trae además ${extra.slice(0, 5).join(', ')}`);
+  }
+}
+
+// §8: cache. ETag en el GET completo de un elemento o un singleton, y 304 a un If-None-Match que coincide.
+function cacheChecks(ex, bad) {
+  const r = ex.route, p = ex.params, s = ex.status, m = ex.method, rh = ex.resHeaders, q = ex.reqHeaders;
+  const full = !p.has('fields') && !p.has('include');
+  if ((r.kind === 'item' || r.kind === 'singleton') && m === 'GET' && s === 200 && full && !rh.etag && !has('writes'))
+    bad('cache-etag', `el GET ${r.kind === 'item' ? 'del elemento' : 'del singleton'} completo no lleva ETag`);
+  if ((m === 'GET' || m === 'HEAD') && s === 200 && q['if-none-match'] && rh.etag) {
+    const list = etagList(q['if-none-match']);
+    if (list.some((t) => t === '*' || weakEq(t, rh.etag))) bad('if-none-match', `If-None-Match: ${q['if-none-match']} coincide con la ETag ${rh.etag} y la respuesta es 200, no 304`);
+  }
+}
+
 function errorChecks(ex, bad) {
   const rh = ex.resHeaders, s = ex.status;
   if (s === 401 && !rh['www-authenticate']) bad('error.401', 'sin WWW-Authenticate');
   if (s === 405 && !rh.allow) bad('error.405', 'sin Allow');
   if ((s === 429 || s === 503) && !rh['retry-after']) bad('error.retry-after', 'sin Retry-After');
+  if (s === 409 && ex.data?.code === 'request_in_progress' && !rh['retry-after']) bad('error.retry-after', '409 request_in_progress sin Retry-After');
   if (ex.method === 'HEAD' || !ex.size) return;
   const t = mediaType(rh['content-type']);
   if (t !== 'application/problem+json') bad('error.media-type', `Content-Type: ${t || '(ninguno)'}`);
@@ -486,10 +738,17 @@ function errorChecks(ex, bad) {
     const codes = expectedCodes(s);
     if (!codes.includes(d.code)) bad('error.code', `code "${d.code}" para ${s}; se esperaba ${codes.join(' o ')}`);
     if (typeof d.type === 'string' && !(d.type === 'about:blank' || (/^[a-z][a-z0-9+.-]*:/i.test(d.type)
-      && (!d.type.startsWith(`${SPEC}errors#`) || d.type === `${SPEC}errors#${d.code}`))))
+      && (!d.type.startsWith(`${PROFILE}errors#`) || d.type === `${PROFILE}errors#${d.code}`))))
       bad('error.type', `type ${d.type} para code ${d.code}`);
   }
   if (!(typeof d.detail === 'string' && d.detail)) bad('error.detail', 'sin detail');
+  // 5.4: reason sigue la gramática de los nombres y, con reasons declarado, es una de ellas con su code.
+  if (d.reason !== undefined) {
+    const declared = isObject(disc?.reasons) ? disc.reasons : null;
+    if (typeof d.reason !== 'string' || !NAME.test(d.reason)) bad('error.reason', `reason ${JSON.stringify(d.reason)} no sigue la gramática de los nombres`);
+    else if (declared && !Object.hasOwn(declared, d.reason)) bad('error.reason', `reason "${d.reason}" no está en reasons`);
+    else if (declared && declared[d.reason]?.code !== d.code) bad('error.reason', `reason "${d.reason}" va con code ${d.code}; reasons dice ${declared[d.reason]?.code}`);
+  }
   if (d.code === 'invalid_parameter' || d.code === 'unsupported_parameter') {
     if (!(typeof d.parameter === 'string' && d.parameter)) bad('error.parameter', `${d.code} sin parameter`);
     else if (d.code === 'unsupported_parameter' && ex.method !== 'QUERY' && !ex.params.has(d.parameter))
@@ -499,6 +758,9 @@ function errorChecks(ex, bad) {
 
 // La declaración de filtro de un campo, o undefined.
 const filterDecl = (c, f) => (isObject(c.filter) && isObject(c.filter[f]) ? c.filter[f] : undefined);
+// La declaración de un filtro con nombre (6.1), o undefined. Sin type es un interruptor.
+const namedDecl = (c, f) => (isObject(c.named_filters) && isObject(c.named_filters[f]) ? c.named_filters[f] : undefined);
+const namedValueOk = (d, raw) => (typeof d.type !== 'string' ? raw === '' : raw !== '' && norm(d.type, raw) !== undefined && enumOk(d, raw));
 const opsOf = (d) => (Array.isArray(d?.ops) ? d.ops : []);
 const parseFilterKey = (k) => { const m = k.match(/^filter\[([^\]]+)\](?:\[([^\]]+)\])?$/); return m ? { field: m[1], op: m[2] ?? 'eq' } : null; };
 // Si el valor de un filtro encaja con su tipo (6.1), para saber si un rechazo es legítimo.
@@ -519,7 +781,7 @@ function implemented(r, method) {
     out.add('fields');
     if (r.kind === 'collection') {
       out.add('limit'); out.add('cursor');
-      if (isObject(c.filter) && Object.keys(c.filter).length) out.add('filter');
+      if ([c.filter, c.named_filters].some((x) => isObject(x) && Object.keys(x).length)) out.add('filter');
       if (Array.isArray(c.sort) && c.sort.length) out.add('sort');
       if (c.count) out.add('count');
     }
@@ -538,15 +800,45 @@ function reservedChecks(ex, bad) {
     for (const k of keys) {
       if (!isReservedName(k)) continue;
       const base = baseName(k);
-      const formOk = k.startsWith('$') ? false : base === 'filter' ? (k !== 'filter' || has('filter-expr')) : k === base;
+      // 5.3: las formas que Restep define son name=value y, para filter, filter[campo] y filter[campo][op].
+      const formOk = k.startsWith('$') ? false : base === 'filter' ? (k === 'filter' ? has('filter-expr') : /^filter\[[^\]]+\](\[[^\]]+\])?$/.test(k)) : k === base;
       if (!impl.has(base) || !formOk) { bad('reserved', `${k} se ha ignorado; se esperaba 400 unsupported_parameter`); continue; }
       if (base === 'filter' && k !== 'filter') {
         const f = parseFilterKey(k);
+        const named = f && namedDecl(c, f.field);
+        if (named) {
+          if (k.includes('][')) bad('query.undeclared', `${f.field} es un filtro con nombre y no lleva operador: ${k} se ha aceptado`);
+          else if (once(p, k) && !namedValueOk(named, p.get(k))) bad('query.named-value', `${k}=${p.get(k)} se ha aceptado; ${typeof named.type === 'string' ? `se esperaba un valor ${named.type}` : 'un interruptor no lleva valor'}`);
+          continue;
+        }
         const decl = f && filterDecl(c, f.field);
         if (!f) bad('query.undeclared', `${k} no es filter[campo] ni filter[campo][op] y se ha aceptado`);
         else if (!decl) bad('query.undeclared', `el campo ${f.field} no está declarado en filter y se ha aceptado`);
         else if (!opsOf(decl).includes(f.op)) bad('query.undeclared', `${f.field} no declara el operador ${f.op} y se ha aceptado`);
       }
+    }
+    // 9: include solo de relaciones declaradas y expandibles, hasta include_depth, sin seguir tras una a varias.
+    if (impl.has('include') && once(p, 'include')) {
+      const depth = Number.isInteger(c.include_depth) ? c.include_depth : 1;
+      for (const path of p.get('include').split(',')) {
+        const segs = path.split('.');
+        let cur = c, why = segs.length > depth ? `pasa de include_depth (${depth})` : null;
+        for (let i = 0; i < segs.length && !why; i++) {
+          const rel = isObject(cur?.relations) ? cur.relations[segs[i]] : undefined;
+          if (!isObject(rel)) why = `${segs.slice(0, i + 1).join('.')} no es una relación declarada`;
+          else if (rel.include !== true) why = `${segs.slice(0, i + 1).join('.')} no es expandible`;
+          else if (Array.isArray(rel.to) && i < segs.length - 1) why = `sigue tras ${segs[i]}, que va a varias colecciones`;
+          else cur = Array.isArray(rel.to) ? null : disc.collections?.[rel.to];
+        }
+        if (why) { bad('relations.include', `include=${path} se ha aceptado y ${why}; se esperaba 400 unsupported_parameter`); break; }
+      }
+    }
+    // 9: una ruta con punto en fields exige que su relación esté en include.
+    if (has('relations') && once(p, 'fields')) {
+      const inc = new Set((once(p, 'include') ? p.get('include').split(',') : []).flatMap((x) => x.split('.').map((_, i, a) => a.slice(0, i + 1).join('.'))));
+      const lost = p.get('fields').split(',').find((f) => f.includes('.') && !(isObject(c.language_maps) && f.split('.')[0] in c.language_maps)
+        && !inc.has(f.slice(0, f.lastIndexOf('.'))));
+      if (lost) bad('relations.fields', `fields con ${lost} se ha aceptado sin include=${lost.slice(0, lost.lastIndexOf('.'))}; se esperaba invalid_parameter`);
     }
     if (impl.has('sort') && once(p, 'sort')) {
       const undeclared = p.get('sort').split(',').map((x) => x.replace(/^-/, '')).filter((f) => f && !c.sort.includes(f));
@@ -560,7 +852,12 @@ function reservedChecks(ex, bad) {
   if (!impl.has(base) || !p.has(k) || !once(p, k)) return;
   const retired = retiredNames(c);
   if (base === 'filter' && k !== 'filter') {
-    const f = parseFilterKey(k), decl = f && filterDecl(c, f.field);
+    const f = parseFilterKey(k), named = f && namedDecl(c, f.field);
+    if (named) {
+      if (!k.includes('][') && !retired.filter.has(f.field) && namedValueOk(named, p.get(k))) bad('query.declared-rejected', `${k}=${p.get(k)} es un filtro con nombre declarado y se ha rechazado con unsupported_parameter`);
+      return;
+    }
+    const decl = f && filterDecl(c, f.field);
     if (!decl || !opsOf(decl).includes(f.op) || retired.filter.has(f.field)) return;
     const dupe = keys.filter((x) => { const g = parseFilterKey(x); return g && g.field === f.field && g.op === f.op; }).length > 1;
     if (!dupe && filterValueOk(decl, f.op, p.get(k))) bad('query.declared-rejected', `${k}=${p.get(k)} está declarado y se ha rechazado con unsupported_parameter`);
@@ -607,7 +904,12 @@ function resourceChecks(ex, bad) {
         if (path !== want) bad('location', `Location: ${loc}; se esperaba ${want}`);
       }
     }
-    if (ok && isObject(ex.reqJson) && 'id' in ex.reqJson) bad('id.assigned', `un POST con "id": ${JSON.stringify(ex.reqJson.id)} ha dado ${s}; se esperaba 422 invalid`);
+    // 5.1: quién elige el id lo dice id_from (sin declarar es "server").
+    const from = c.id_from ?? 'server';
+    if (ok && isObject(ex.reqJson) && 'id' in ex.reqJson && (from === 'server'))
+      bad('id.assigned', `un POST con "id": ${JSON.stringify(ex.reqJson.id)} ha dado ${s}; id_from es ${JSON.stringify(c.id_from)}, se esperaba 422 invalid`);
+    if (ok && isObject(ex.reqJson) && !('id' in ex.reqJson) && from === 'client')
+      bad('id.assigned', `un POST sin id ha dado ${s}; id_from es "client", se esperaba 422 invalid con required en /id`);
   }
   if (m === 'PATCH' && r.kind === 'item' && ok) {
     if (ex.reqJsonParsed && !isObject(ex.reqJson)) bad('patch.object', `un parche ${Array.isArray(ex.reqJson) ? 'que es una lista' : 'que no es un objeto'} ha dado ${s}; se esperaba 400 bad_request`);
@@ -623,6 +925,12 @@ function resourceChecks(ex, bad) {
     if (!Array.isArray(d.items) || !('next' in d)) { bad('collection.shape', `el cuerpo no es {items, next}${Array.isArray(d.items) ? ': falta next' : ''}`); return; }
     if (!(d.next === null || typeof d.next === 'string')) { bad('collection.shape', `next es ${JSON.stringify(d.next)}, no una cadena ni null`); return; }
     items = d.items.filter(isObject);
+    // 7.2: un elemento que admite PATCH o DELETE lleva en _etag su ETag de elemento; en una colección
+    // que declara sync, en todas las páginas y como DEBE.
+    if (has('writes') && Array.isArray(c.item_methods) && c.item_methods.some((x) => x === 'PATCH' || x === 'DELETE')) {
+      const missing = items.filter((it) => typeof it._etag !== 'string');
+      if (missing.length) bad(synced(c) ? 'etag.synced' : 'etag.collection', `${missing.length} de ${items.length} elementos sin _etag (el primero, ${JSON.stringify(missing[0].id)}); admiten ${c.item_methods.join(', ')}`);
+    }
     if (typeof d.next === 'string') nextChecks(ex, d.next, bad);
     if (has('query')) queryChecks(ex, items, fields, bad);
   } else if (r.kind === 'item' && m !== 'DELETE') items = [d];
@@ -636,11 +944,57 @@ function resourceChecks(ex, bad) {
       if (extra.length) { bad('fields', `fields=${p.get('fields')} y el elemento ${it.id} trae además ${extra.slice(0, 5).join(', ')}`); break; }
     }
   }
-  // 3, 4.2, 5.7: coherencia con el descubrimiento.
+  // 3, 4.2, 11.6: coherencia con el descubrimiento.
   for (const it of items) {
     const problems = itemProblems(c, it, !!fields || p.has('include'));
     if (problems.length) { bad('item.discovery', problems.slice(0, 3).join('; ')); break; }
   }
+  // 3 y 9: type en las relaciones a varias colecciones, href en las que van a una subcolección.
+  for (const it of items) {
+    const problems = linkProblems(c, it);
+    if (problems.length) { bad('relations.link', problems.slice(0, 3).join('; ')); break; }
+  }
+  // 11.1: _actions solo lista acciones declaradas, de elemento y con su método.
+  if (has('actions')) for (const it of items) {
+    if (!isObject(it._actions)) continue;
+    const decl = isObject(c.actions) ? c.actions : {};
+    const wrong = Object.entries(it._actions).find(([n, v]) => !isObject(decl[n]) || decl[n].on !== 'item' || (isObject(v) && v.method !== undefined && v.method !== (decl[n].method ?? 'POST')));
+    if (wrong) { bad('actions.listed', `el elemento ${it.id} lista en _actions ${wrong[0]} (${JSON.stringify(wrong[1])}), que ${isObject(decl[wrong[0]]) ? 'se declara de otra forma' : 'no se declara'}`); break; }
+  }
+}
+// La colección del descubrimiento que es una subcolección (con parent o con plantilla en path).
+const isSub = (name) => { const c = disc?.collections?.[name]; return isObject(c) && (c.parent !== undefined || /[{}]/.test(String(c.path))); };
+function linkProblems(c, it) {
+  const out = [];
+  for (const [rel, decl] of Object.entries(isObject(c.relations) ? c.relations : {})) {
+    if (!isObject(decl) || !(rel in it) || it[rel] === null) continue;
+    const to = [].concat(decl.to ?? []);
+    for (const v of [].concat(it[rel])) {
+      if (!isObject(v)) continue;
+      const kind = Array.isArray(decl.to) ? v.type : decl.to;
+      if (Array.isArray(decl.to) && !to.includes(v.type)) out.push(`${it.id}.${rel} va a varias colecciones y su enlace ${v.id} no lleva un type de ${to.join(', ')}`);
+      else if (isSub(kind) && (typeof v.href !== 'string' || !String(v.href).replace(/\/+$/, '').endsWith(`/${v.id}`)))
+        out.push(`${it.id}.${rel} enlaza ${v.id}, de la subcolección ${kind}, sin un href que acabe en su id`);
+    }
+  }
+  return out;
+}
+// 11.1: una acción.
+function actionChecks(ex, bad) {
+  const r = ex.route, s = ex.status, ok = s >= 200 && s < 300, m = ex.method;
+  const decl = isObject(r.r.c.actions) ? r.r.c.actions[r.action] : undefined;
+  const kind = r.id ? 'item' : 'collection';
+  if (ok && (!isObject(decl) || decl.on !== kind)) bad('actions.undeclared', `${r.action} ${isObject(decl) ? `se declara en el otro tipo de recurso (${decl.on})` : 'no se declara'} y ha dado ${s}; se esperaba 404`);
+  if (!isObject(decl) || decl.on !== kind) return;
+  const method = decl.method ?? 'POST';
+  if (ok && m !== method && !(method === 'GET' && m === 'HEAD')) bad('actions.undeclared', `${r.action} se declara con ${method} y ${m} ha dado ${s}; se esperaba 405`);
+  if (ok && m === method && m === 'POST') {
+    if (![200, 201, 204].includes(s)) bad('actions.response', `${r.action} ha dado ${s}; se esperaba 200, 201 o 204`);
+    if (s === 201 && !ex.resHeaders.location) bad('actions.response', `${r.action} ha dado 201 sin Location`);
+  }
+  const empty = !ex.reqBody || ex.reqBody.length === 0;
+  if (m === 'POST' && method === 'POST' && empty && (s === 415 || (s === 400 && ex.data?.code === 'bad_request' && !(ex.data.errors ?? []).some((e) => e?.header))))
+    bad('actions.empty-body', `${r.action} con el cuerpo vacío ha dado ${s}; se esperaba que lo tratase como {}`);
 }
 
 // 6.4: next conserva los parámetros y lleva cursor.
@@ -715,7 +1069,8 @@ function inferType(items, f) {
   return null;
 }
 
-// 3, 4.2 y 5.7: lo que el descubrimiento dice de un elemento.
+// 3, 4.2 y 11.6: lo que el descubrimiento dice de un elemento. La herencia solo con la extensión inherit
+// anunciada y un texto conocido (§1.2: es experimental).
 function itemProblems(c, it, partial) {
   const out = [];
   const id = it.id ?? '?';
@@ -735,7 +1090,7 @@ function itemProblems(c, it, partial) {
     const v = it[rel], isLink = (x) => isObject(x) && typeof x.id === 'string';
     if (decl?.many ? !(Array.isArray(v) && v.every(isLink)) && !isLink(v) : !isLink(v)) out.push(`${id}.${rel} es una relación y vale ${JSON.stringify(v).slice(0, 60)}`);
   }
-  if (!partial) for (const [f, rule] of Object.entries(isObject(c.inherit) ? c.inherit : {})) {
+  if (!partial && has('inherit') && knownText) for (const [f, rule] of Object.entries(isObject(c.inherit) ? c.inherit : {})) {
     if (!isObject(rule) || typeof rule.own !== 'string' || (!(f in it) && !(rule.own in it))) continue;
     if (!(rule.own in it)) { out.push(`${id} trae ${f} pero no su campo propio ${rule.own}`); continue; }
     const own = it[rule.own], eff = it[f];
@@ -751,27 +1106,30 @@ function itemProblems(c, it, partial) {
 function writesChecks(ex, bad) {
   const r = ex.route, p = ex.params, s = ex.status, ok = s >= 200 && s < 300, m = ex.method, rh = ex.resHeaders, q = ex.reqHeaders, d = ex.data;
   const write = !['GET', 'HEAD', 'QUERY', 'OPTIONS'].includes(m);
-  // 7.2: ETag de elemento.
-  if (r.kind === 'item' && m === 'GET' && s === 200) {
+  const itemLike = r.kind === 'item' || r.kind === 'singleton';
+  // 7.2: ETag de elemento, fuerte en el GET completo sin codificación.
+  if (itemLike && m === 'GET' && s === 200) {
     const partial = p.has('fields') || p.has('include');
     const encoded = rh['content-encoding'] && rh['content-encoding'].toLowerCase() !== 'identity';
     if (!partial && !encoded) {
-      if (!rh.etag) bad('etag', 'el GET del elemento completo no lleva ETag');
+      if (!rh.etag) bad('etag', `el GET ${r.kind === 'item' ? 'del elemento' : 'del singleton'} completo no lleva ETag`);
       else if (rh.etag.startsWith('W/')) bad('etag', `la ETag de elemento es débil: ${rh.etag}`);
-    } else if (isObject(d) && typeof d._etag !== 'string') bad('etag', `${partial ? 'con fields o include' : `con Content-Encoding: ${rh['content-encoding']}`} el elemento no lleva _etag`);
+    }
   }
-  // 7.3: If-None-Match que coincide con la representación da 304.
-  if ((m === 'GET' || m === 'HEAD') && s === 200 && q['if-none-match'] && rh.etag) {
-    const list = etagList(q['if-none-match']);
-    if (list.some((t) => t === '*' || weakEq(t, rh.etag))) bad('if-none-match', `If-None-Match: ${q['if-none-match']} coincide con la ETag ${rh.etag} y la respuesta es 200, no 304`);
-  }
+  // 7.2: toda respuesta cuyo cuerpo es un elemento, a una lectura o a una escritura, lleva _etag.
+  const oneItem = (itemLike && (m === 'GET' || m === 'PATCH')) || (r.kind === 'collection' && m === 'POST' && s === 201);
+  if (oneItem && ok && isObject(d) && typeof d._etag !== 'string')
+    bad('etag', `la respuesta ${s} a ${m} es un elemento y no lleva _etag${p.has('fields') ? ' (con fields)' : ''}`);
   // 7.2: 412 y 428 con sentido.
   if (s === 412 && !q['if-match'] && !q['if-none-match'] && !q['if-unmodified-since']) bad('precondition', '412 sin ninguna cabecera condicional en la petición');
   if (s === 428 && q['if-match']) bad('precondition', `428 a una petición que lleva If-Match: ${q['if-match']}`);
   if (s === 428 && !write) bad('precondition', `428 a un ${m}, que no es una escritura`);
   // 7.2: If-Match y If-None-Match contra la ETag de elemento que el proxy ha visto.
   const pre = ex.pre;
-  if (r.kind === 'item' && (m === 'PATCH' || m === 'DELETE') && pre.etag && !pre.concurrent && writeSeq.get(ex.pathname) === pre.seq) {
+  // 7.2: una escritura a un elemento recién borrado da 404, digan lo que digan las precondiciones.
+  if (r.kind === 'item' && (m === 'PATCH' || m === 'DELETE') && s === 412 && pre.deleted && !pre.concurrent && writeSeq.get(ex.pathname) === pre.seq)
+    bad('if-match', `${m} a ${ex.pathname}, que el proxy vio borrar, ha dado 412; se esperaba 404`);
+  if (itemLike && (m === 'PATCH' || m === 'DELETE') && pre.etag && !pre.concurrent && writeSeq.get(ex.pathname) === pre.seq) {
     const { current, old } = pre.etag;
     if (q['if-match'] && !etagList(q['if-match']).includes('*')) {
       const list = etagList(q['if-match']);
@@ -781,13 +1139,11 @@ function writesChecks(ex, bad) {
     if (q['if-none-match'] && ok && etagList(q['if-none-match']).some((t) => t === '*' || weakEq(t, current)))
       bad('if-none-match', `If-None-Match: ${q['if-none-match']} coincide con la ETag vigente ${current} y la escritura ha dado ${s}; se esperaba 412`);
   }
-  // 7.4: respuesta mínima.
-  if (/(^|[\s,;])return=minimal\b/i.test(q.prefer ?? '') && write && ok && !ex.size) {
-    const missing = [];
-    if (s !== 204 || m !== 'DELETE') { if (!rh.etag) missing.push('ETag'); }
-    if (s === 201 && !rh.location) missing.push('Location');
-    if (!rh['preference-applied']) missing.push('Preference-Applied');
-    if (missing.length) bad('minimal', `respuesta mínima ${s} sin ${missing.join(', ')}`);
+  // 7.3: respuesta mínima. La ETag es un DEBE (salvo tras un DELETE); Preference-Applied, un DEBERÍA.
+  // Location en un 201 la exige siempre 5.1 (location).
+  if (/(^|[\s,;])return=minimal\b/i.test(q.prefer ?? '') && write && ok && !ex.size && r.kind !== 'action') {
+    if (m !== 'DELETE' && !rh.etag) bad('minimal.etag', `respuesta mínima ${s} a ${m} sin ETag`);
+    if (!rh['preference-applied']) bad('minimal', `respuesta mínima ${s} sin Preference-Applied`);
   }
 }
 
@@ -801,6 +1157,20 @@ function idempotencyChecks(ex, bad) {
     if (ok) bad('idempotency.key', `Idempotency-Key: ${raw} no es una cadena de Structured Fields y ha dado ${s}; se esperaba 400 bad_request`);
     return;
   }
+  // 11.1: una acción declarada idempotente no rechaza una clave bien formada; sin credenciales y con
+  // "anonymous": false, la ignora. 7.1: con "anonymous": false, una clave sin credenciales da 400 sin efecto.
+  const r = ex.route, act = r.kind === 'action' ? (isObject(r.r.c.actions) ? r.r.c.actions[r.action] : undefined) : undefined;
+  const idempotentAction = isObject(act) && act.idempotent === true;
+  const keyRefused = s === 400 && ex.data?.code === 'bad_request' && (ex.data.errors ?? []).some((e) => String(e?.header ?? '').toLowerCase() === 'idempotency-key');
+  if (idempotentAction) {
+    if (keyRefused) bad('idempotency.key', `la acción ${r.action} es idempotente y ha rechazado una Idempotency-Key bien formada`);
+    return;
+  }
+  const anonymous = !ex.reqHeaders.authorization && !ex.reqHeaders.cookie;
+  if (anonymous && isObject(disc?.idempotency) && disc.idempotency.anonymous === false) {
+    if (ok) bad('idempotency.key', `"anonymous": false y una Idempotency-Key sin credenciales ha dado ${s}; se esperaba 400 bad_request`);
+    return;
+  }
   const prev = ex.pre.idem;
   if (!prev || prev.pending || prev.status === undefined || !(prev.status >= 200 && prev.status < 300)) return;
   if (ex.pre.idemPrint === prev.print) {
@@ -808,49 +1178,81 @@ function idempotencyChecks(ex, bad) {
     if (s !== prev.status) bad('idempotency.replay', `la repetición ha dado ${s}; la primera, ${prev.status}`);
     else if (body !== prev.body) bad('idempotency.replay', 'la repetición devuelve otro cuerpo que la primera');
     else if (ex.resHeaders['idempotent-replayed'] !== 'true') bad('idempotency.replayed-header', 'la repetición no lleva Idempotent-Replayed: true');
-  } else if (ok) bad('idempotency.mismatch', `la misma Idempotency-Key con otro cuerpo ha dado ${s}; se esperaba 422 idempotency_mismatch`);
+  } else if (ok) bad('idempotency.mismatch', `la misma Idempotency-Key con otra petición (cuerpo o query) ha dado ${s}; se esperaba 422 idempotency_mismatch`);
 }
 
-// 5.5: retiradas declaradas en el descubrimiento.
-function deprecationsFor(c) {
+// 5.5: retiradas declaradas en el descubrimiento. Cada kind va en su sitio; uno desconocido, o fuera
+// de su sitio, no se usa (4.2).
+const KINDS = {
+  root: ['version', 'profile', 'extension', 'collection', 'singleton', 'reason'],
+  collection: ['field', 'filter', 'operator', 'value', 'sort', 'relation', 'include', 'count', 'max_limit', 'action', 'method', 'item_method'],
+  singleton: ['field', 'method'],
+};
+function deprecationsFor(r) {
   const out = [];
-  for (const x of Array.isArray(disc?.deprecations) ? disc.deprecations : []) if (isObject(x)) out.push({ ...x, scope: 'root' });
-  for (const x of Array.isArray(c?.deprecations) ? c.deprecations : []) if (isObject(x)) out.push({ ...x, scope: 'collection' });
+  const add = (list, scope) => { for (const x of Array.isArray(list) ? list : []) if (isObject(x) && KINDS[scope].includes(x.kind)) out.push({ ...x, scope }); };
+  add(disc?.deprecations, 'root');
+  if (r?.kind === 'singleton') add(r.r.c.deprecations, 'singleton');
+  else if (r?.r?.c) add(r.r.c.deprecations, 'collection');
   return out;
 }
 const passed = (x) => typeof x.sunset === 'string' && Date.parse(x.sunset) <= Date.now();
 function retiredNames(c) {
   const out = { filter: new Set(), sort: new Set() };
-  for (const x of deprecationsFor(c)) if (passed(x) && (x.kind === 'filter' || x.kind === 'sort')) out[x.kind].add(x.name);
+  for (const x of deprecationsFor({ r: { c } })) if (passed(x) && (x.kind === 'filter' || x.kind === 'sort' || x.kind === 'field')) {
+    if (x.kind !== 'sort') out.filter.add(x.name);
+    if (x.kind !== 'filter') out.sort.add(x.name);
+  }
   return out;
 }
 function deprecationChecks(ex, bad) {
   const r = ex.route;
-  if (!disc || r.kind === 'other') return;
-  const c = r.r?.c, p = ex.params, s = ex.status, ok = s >= 200 && s < 300;
-  const filterFields = [...p.keys()].map(parseFilterKey).filter(Boolean).map((f) => f.field);
+  if (!disc || r.kind === 'other' || r.kind === 'events') return;
+  const p = ex.params, s = ex.status, ok = s >= 200 && s < 300, d = ex.data;
+  const filters = [...p.keys()].map((k) => ({ k, f: parseFilterKey(k) })).filter((x) => x.f);
+  const filterFields = filters.map((x) => x.f.field);
   const sortFields = once(p, 'sort') ? p.get('sort').split(',').map((x) => x.replace(/^-/, '')) : [];
   const includes = once(p, 'include') ? p.get('include').split(',').map((x) => x.split('.')[0]) : [];
-  for (const x of deprecationsFor(c)) {
-    const used = x.kind === 'version' ? true
-      : x.kind === 'collection' ? x.scope === 'root' && r.r?.name === x.name
-      : !c || x.scope !== 'collection' ? false
-      : x.kind === 'method' ? r.kind === 'collection' && ex.method === x.name
-      : x.kind === 'item_method' ? r.kind === 'item' && ex.method === x.name
-      : x.kind === 'filter' ? filterFields.includes(x.name)
-      : x.kind === 'sort' ? sortFields.includes(x.name)
-      : x.kind === 'relation' ? includes.includes(x.name)
-      : x.kind === 'action' ? r.kind === 'action' && r.action === x.name : false;
-    if (!used) continue;
-    const what = `${x.kind}${x.name ? ` ${x.name}` : ''}`;
-    if (!passed(x)) {
-      if (!ok) continue;
-      if (!ex.resHeaders.deprecation) bad('deprecation', `usa ${what}, retirado en el descubrimiento, y la respuesta no lleva Deprecation`);
-      else if (['version', 'collection', 'action'].includes(x.kind) && x.sunset && !ex.resHeaders.sunset) bad('deprecation', `usa ${what}, con fecha de retirada ${x.sunset}, y la respuesta no lleva Sunset`);
-    } else if (ok) {
-      const want = ['version', 'collection', 'action'].includes(x.kind) ? '410 retired' : x.kind.endsWith('method') ? '405' : '400 unsupported_parameter';
-      bad('deprecation', `usa ${what}, retirado el ${x.sunset}, y ha dado ${s}; se esperaba ${want}`);
+  const fieldsParam = once(p, 'fields') ? p.get('fields').split(',') : [];
+  const named = [...filterFields, ...sortFields, ...includes, ...fieldsParam];
+  // Un aviso field cubre el campo y las rutas con punto que empiezan por él (author.id para author).
+  const covers = (name, x) => x === name || String(x).startsWith(`${name}.`);
+  const carries = (name) => (isObject(d) && (name in d || (Array.isArray(d.items) && d.items.some((it) => isObject(it) && name in it))));
+  const resourceName = r.r?.name;
+  for (const x of deprecationsFor(r)) {
+    let used;
+    switch (x.kind) {
+      case 'version': case 'profile': case 'extension': used = true; break;
+      case 'collection': used = r.kind !== 'singleton' && r.kind !== 'discovery' && resourceName === x.name; break;
+      case 'singleton': used = r.kind === 'singleton' && resourceName === x.name; break;
+      case 'reason': used = s >= 400 && d?.reason === x.name; break;
+      case 'field': used = carries(x.name) || named.some((n) => covers(x.name, n)); break;
+      case 'filter': used = filterFields.includes(x.name); break;
+      case 'operator': used = filters.some(({ f }) => f.field === x.name && f.op === x.op); break;
+      case 'value': used = filters.some(({ k, f }) => f.field === x.name && ['eq', 'in', 'ne'].includes(f.op) && p.getAll(k).some((v) => v.split(',').includes(String(x.value)))); break;
+      case 'sort': used = sortFields.includes(x.name); break;
+      case 'relation': used = includes.includes(x.name) || [...filterFields, ...sortFields, ...fieldsParam].some((n) => n.startsWith(`${x.name}.`)); break;
+      case 'include': used = includes.includes(x.name); break;
+      case 'count': used = p.has('count'); break;
+      case 'max_limit': used = Number.isInteger(x.value) && /^\d+$/.test(p.get('limit') ?? '') && Number(p.get('limit')) > x.value; break;
+      case 'action': used = r.kind === 'action' && r.action === x.name; break;
+      case 'method': used = x.scope === 'singleton' ? ex.method === x.name : r.kind === 'collection' && ex.method === x.name; break;
+      case 'item_method': used = r.kind === 'item' && ex.method === x.name; break;
+      default: used = false;
     }
+    if (!used) continue;
+    const what = `${x.kind}${x.name !== undefined ? ` ${x.name}` : ''}${x.op ? ` ${x.op}` : ''}${x.value !== undefined ? ` (${x.value})` : ''}`;
+    const whole = ['version', 'collection', 'singleton', 'action'].includes(x.kind);
+    if (!passed(x)) {
+      if (!ok && x.kind !== 'reason') continue;
+      if (!ex.resHeaders.deprecation) bad('deprecation', `usa ${what}, retirado en el descubrimiento, y la respuesta no lleva Deprecation`);
+      else if (!linkTargets(ex.resHeaders.link, 'deprecation').length) bad('deprecation', `usa ${what} y lleva Deprecation, pero no un Link con rel="deprecation"`);
+      else if (whole && x.sunset && !ex.resHeaders.sunset) bad('deprecation', `usa ${what}, con fecha de retirada ${x.sunset}, y la respuesta no lleva Sunset`);
+    } else if (ok && !['profile', 'extension', 'field', 'reason'].includes(x.kind)) {
+      const want = whole ? '410 retired' : x.kind.endsWith('method') ? '405' : ['value', 'max_limit'].includes(x.kind) ? '400 invalid_parameter' : '400 unsupported_parameter';
+      bad('deprecation', `usa ${what}, retirado el ${x.sunset}, y ha dado ${s}; se esperaba ${want}`);
+    } else if (x.kind === 'reason') bad('deprecation', `la razón ${x.name} se retiró el ${x.sunset} y se sigue dando`);
+    else if (x.kind === 'field' && ok && carries(x.name)) bad('deprecation', `el campo ${x.name} se retiró el ${x.sunset} y sigue en la respuesta`);
   }
 }
 
@@ -858,7 +1260,7 @@ function deprecationChecks(ex, bad) {
 function prepare(ex) {
   const write = ['POST', 'PATCH', 'DELETE', 'PUT'].includes(ex.method);
   const e = etags.get(ex.pathname);
-  ex.pre = { etag: e ? { current: e.current, old: new Set(e.old) } : null, concurrent: (inflight.get(ex.pathname) ?? 0) > 0 };
+  ex.pre = { etag: e ? { current: e.current, old: new Set(e.old) } : null, concurrent: (inflight.get(ex.pathname) ?? 0) > 0, deleted: deleted.has(ex.pathname) };
   if (write) {
     ex.pre.seq = (writeSeq.get(ex.pathname) ?? 0) + 1;
     writeSeq.set(ex.pathname, ex.pre.seq);
@@ -873,9 +1275,14 @@ function prepareBody(ex) {
   }
   const raw = ex.reqHeaders['idempotency-key'];
   if (ex.method !== 'POST' || raw === undefined || !SF_STRING.test(raw.trim())) return;
-  const scope = `${hash(ex.reqHeaders.authorization ?? '')} ${ex.method} ${ex.pathname}${[...ex.params].length ? `?${ex.params}` : ''} ${raw.trim()}`;
+  // 7.1: la clave es del principal y del destino (método y ruta, sin la query); la query y el cuerpo
+  // deciden si es «la misma petición».
+  let path = ex.pathname;
+  try { path = decodeURIComponent(path); } catch {}
+  const scope = `${hash(ex.reqHeaders.authorization ?? '')} ${ex.method} ${path} ${raw.trim()}`;
   ex.idemScope = scope;
-  ex.pre.idemPrint = hash(ex.reqJsonParsed ? canonical(ex.reqJson) : (ex.reqBody ?? Buffer.alloc(0)).toString('base64'));
+  const query = [...ex.params].map(([k, v]) => `${k}=${v}`).sort();
+  ex.pre.idemPrint = hash(canonical([query, ex.reqJsonParsed ? canonical(ex.reqJson) : (ex.reqBody ?? Buffer.alloc(0)).toString('base64')]));
   const saved = idem.get(scope);
   const live = saved && (saved.pending || saved.expires > Date.now()) ? saved : null;
   ex.pre.idem = live ? { ...live } : null;
@@ -885,7 +1292,7 @@ function learn(ex) {
   const r = ex.route, s = ex.status, ok = s >= 200 && s < 300, d = ex.data, rh = ex.resHeaders;
   if (ex.isWrite) inflight.set(ex.pathname, Math.max(0, (inflight.get(ex.pathname) ?? 1) - 1));
   // Descubrimiento que pasa por el proxy.
-  if (r.kind === 'discovery' && ex.method === 'GET' && s === 200 && isObject(d) && typeof d.restep === 'string') setDiscovery(d);
+  if (r.kind === 'discovery' && ex.method === 'GET' && s === 200 && isObject(d) && typeof d.restep === 'string' && restep1(d)) setDiscovery(d);
   // ETags de elemento (7.2).
   const setTag = (path, tag) => {
     if (typeof tag !== 'string' || tag.startsWith('W/')) return;
@@ -895,7 +1302,9 @@ function learn(ex) {
     e.current = tag;
     etags.set(path, e);
   };
-  if (r.kind === 'item' && ok) {
+  if (r.kind === 'item' && ok && ex.method === 'DELETE') deleted.add(ex.pathname);
+  else if (r.kind === 'item' && ok) deleted.delete(ex.pathname);
+  if ((r.kind === 'item' || r.kind === 'singleton') && ok) {
     const partial = ex.params.has('fields') || ex.params.has('include');
     const encoded = rh['content-encoding'] && rh['content-encoding'].toLowerCase() !== 'identity';
     if (ex.method === 'DELETE') etags.delete(ex.pathname);
@@ -904,7 +1313,7 @@ function learn(ex) {
   }
   if (r.kind === 'collection' && ex.method === 'POST' && s === 201 && rh.location) {
     const tag = isObject(d) && typeof d._etag === 'string' ? d._etag : rh.etag;
-    try { if (tag) setTag(new URL(rh.location, target).pathname, tag); } catch {}
+    try { const at = new URL(rh.location, target).pathname; deleted.delete(at); if (tag) setTag(at, tag); } catch {}
   }
   if (r.kind === 'collection' && ex.method === 'GET' && ok && Array.isArray(d?.items))
     for (const it of d.items) if (isObject(it) && typeof it._etag === 'string' && typeof it.id === 'string') setTag(`${ex.pathname.replace(/\/$/, '')}/${encodeURIComponent(it.id)}`, it._etag);
@@ -1074,7 +1483,7 @@ function onResponse(ex, req, res, upres) {
     stats.replaced++;
     sendProblem(res, 502, 'bad_gateway', 'La respuesta de la API incumple Restep',
       `restep-proxy --strict: ${must.length} violación(es) en la respuesta ${ex.status} a ${ex.method} ${ex.url}: ${must.map((f) => `${f.id}: ${f.msg}`).join(' | ')}`,
-      { upstream_status: ex.status, violations: must.map((f) => ({ check: f.id, section: CHECKS[f.id][0], spec: sectionUrl(CHECKS[f.id][0]), message: f.msg })) });
+      { upstream_status: ex.status, violations: must.map((f) => ({ check: f.id, section: CHECKS[f.id][0], spec: sectionUrl(CHECKS[f.id][0], f.id), message: f.msg })) });
   });
 }
 
@@ -1141,7 +1550,8 @@ async function loadDiscovery() {
   try {
     const r = await fetch(target, { headers, signal: AbortSignal.timeout(5000) });
     const d = await r.json().catch(() => null);
-    if (r.ok && isObject(d) && typeof d.restep === 'string') { setDiscovery(d); return `descubrimiento leído: ${announced.join(', ')}; ${routes.length} colecciones`; }
+    if (r.ok && isObject(d) && typeof d.restep === 'string' && !restep1(d)) return `la raíz declara "restep": ${JSON.stringify(d.restep)}, que no es Restep 1 (§1.1): solo core hasta que pase un descubrimiento de Restep 1`;
+    if (r.ok && isObject(d) && typeof d.restep === 'string') { setDiscovery(d); return `descubrimiento leído (${d.restep}${knownText ? '' : ', sin juzgar sus partes experimentales'}): ${announced.join(', ')}; ${routes.length} colecciones, ${singletonRoutes.size} singletons`; }
     return `la raíz respondió ${r.status} sin documento de descubrimiento: solo core hasta que pase uno por el proxy`;
   } catch (e) {
     return `no se pudo leer el descubrimiento (${e.cause?.code ?? e.message}): solo core hasta que pase uno por el proxy`;
