@@ -1,7 +1,7 @@
 {
   "name": "restep-proxy",
   "version": "0.2.0",
-  "description": "Proxy inverso que vigila el contrato Restep 1 en tráfico real",
+  "description": "Reverse proxy that watches the Restep 1 contract in real traffic",
   "type": "module",
   "bin": {
     "restep-proxy": "restep-proxy.mjs"
